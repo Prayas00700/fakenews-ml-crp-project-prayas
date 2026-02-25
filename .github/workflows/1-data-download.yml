@@ -1,0 +1,153 @@
+name: "1. Download Data to S3"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# When to run
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  # Manual trigger from GitHub UI
+  workflow_dispatch:
+
+  # Trigger when the download script changes
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/data/data_download.py'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Environment variables — ALL sourced from GitHub Secrets / Variables
+# Set these in:  Settings → Secrets and variables → Actions
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  AWS_REGION:   ${{ vars.AWS_REGION }}        # e.g. ap-south-1
+  S3_BUCKET:    ${{ secrets.S3_BUCKET }}      # e.g. fake-news-mlops-bucket
+  PROJECT_NAME: ${{ vars.PROJECT_NAME }}      # e.g. fake-news
+
+jobs:
+  download-data:
+    name: "Upload Fake News Datasets to S3"
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write   # Required for AWS OIDC role assumption
+      contents: read
+
+    steps:
+      # ================================================================
+      # Step 1: Checkout code
+      # ================================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ================================================================
+      # Step 2: Setup Python
+      # ================================================================
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      # ================================================================
+      # Step 3: Install dependencies
+      # ================================================================
+      - name: Install dependencies
+        run: |
+          pip install pandas boto3
+
+      # ================================================================
+      # Step 4: Configure AWS credentials (OIDC — no long-lived keys)
+      # ================================================================
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      # ================================================================
+      # Step 5: Verify local CSV files exist in the repo
+      # ================================================================
+      - name: Verify local data files
+        run: |
+          echo "Checking for required CSV files in data/local/..."
+
+          for FILE in "fake_or_real_news.csv" "FakeNewsNet.csv"; do
+            if [ ! -f "data/local/$FILE" ]; then
+              echo "ERROR: data/local/$FILE not found!"
+              echo "Please commit your CSV files to data/local/ before running this workflow."
+              exit 1
+            fi
+            SIZE=$(du -sh "data/local/$FILE" | cut -f1)
+            echo "  Found: data/local/$FILE  ($SIZE)"
+          done
+
+          echo "All required files found"
+
+      # ================================================================
+      # Step 6: Upload datasets to S3
+      # (creates bucket + folder structure if they don't exist)
+      # ================================================================
+      - name: Upload datasets to S3
+        run: |
+          echo "Uploading datasets to s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/raw/"
+
+          python src/data/data_download.py \
+            --bucket   ${{ env.S3_BUCKET }} \
+            --project  ${{ env.PROJECT_NAME }} \
+            --data-dir data/local
+
+          echo "Upload complete"
+
+      # ================================================================
+      # Step 7: Verify upload
+      # ================================================================
+      - name: Verify S3 upload
+        run: |
+          echo "Verifying files in S3..."
+
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/raw/ \
+            --recursive \
+            --human-readable
+
+          FILE_COUNT=$(aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/raw/ \
+            --recursive | grep -c ".csv" || true)
+
+          echo "Found $FILE_COUNT CSV file(s) in S3"
+
+          if [ "$FILE_COUNT" -lt 2 ]; then
+            echo "ERROR: Expected at least 2 CSV files — upload may have failed"
+            exit 1
+          fi
+
+          echo "S3 upload verified"
+
+      # ================================================================
+      # Step 8: Save S3 paths artifact for downstream jobs
+      # ================================================================
+      - name: Save S3 paths artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name:            s3-paths
+          path:            s3_paths.env
+          retention-days:  7
+
+      # ================================================================
+      # Step 9: Create summary
+      # ================================================================
+      - name: Create summary
+        run: |
+          echo "## Data Upload Summary 📊" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Datasets uploaded successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Details:**" >> $GITHUB_STEP_SUMMARY
+          echo "- S3 Bucket:    \`${{ env.S3_BUCKET }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Project:      \`${{ env.PROJECT_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Region:       \`${{ env.AWS_REGION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Files in S3:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/raw/ \
+            --recursive --human-readable >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next Step:** Run '2. Data Preprocessing (SageMaker)'" >> $GITHUB_STEP_SUMMARY

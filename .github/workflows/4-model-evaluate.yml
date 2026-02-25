@@ -1,0 +1,186 @@
+name: "4. Model Evaluate"
+
+on:
+  workflow_run:
+    workflows: ["3. Model Training (SageMaker)"]
+    types: [completed]
+
+  workflow_dispatch:
+    inputs:
+      model_data:
+        description: 'S3 URI of the model artifact (model.tar.gz)'
+        required: true
+      model_type:
+        description: 'nb | lstm | bert'
+        required: true
+        default: 'lstm'
+        type: choice
+        options:
+          - nb
+          - lstm
+          - bert
+
+env:
+  AWS_REGION:   ${{ vars.AWS_REGION }}
+  S3_BUCKET:    ${{ secrets.S3_BUCKET }}
+  PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+
+jobs:
+  evaluate:
+    name: "Evaluate Model & Check Quality Gates"
+    runs-on: ubuntu-latest
+
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    outputs:
+      quality-gate-passed: ${{ steps.gate.outputs.passed }}
+      model-accuracy:      ${{ steps.gate.outputs.accuracy }}
+      model-f1-fake:       ${{ steps.gate.outputs.f1_fake }}
+
+    steps:
+      # ================================================================
+      # Step 1: Checkout
+      # ================================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ================================================================
+      # Step 2: Resolve MODEL_DATA / MODEL_TYPE
+      # ================================================================
+      - name: Download model-data artifact (if chained via workflow_run)
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name:         model-data
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id:       ${{ github.event.workflow_run.id }}
+
+      - name: Load MODEL_DATA from artifact
+        if: github.event_name == 'workflow_run'
+        run: |
+          source model_data.env
+          echo "MODEL_DATA=$MODEL_DATA" >> $GITHUB_ENV
+          echo "MODEL_TYPE=$MODEL_TYPE" >> $GITHUB_ENV
+
+      - name: Load MODEL_DATA from manual inputs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "MODEL_DATA=${{ github.event.inputs.model_data }}" >> $GITHUB_ENV
+          echo "MODEL_TYPE=${{ github.event.inputs.model_type }}" >> $GITHUB_ENV
+
+      # ================================================================
+      # Step 3: Setup Python
+      # ================================================================
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      # ================================================================
+      # Step 4: Install dependencies
+      # ================================================================
+      - name: Install base dependencies
+        run: pip install boto3 pandas numpy pyarrow scikit-learn
+
+      - name: Install TensorFlow (lstm only)
+        if: env.MODEL_TYPE == 'lstm'
+        run: pip install tensorflow
+
+      - name: Install PyTorch + Transformers (bert only)
+        if: env.MODEL_TYPE == 'bert'
+        run: pip install torch transformers
+
+      # ================================================================
+      # Step 5: Configure AWS credentials
+      # ================================================================
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      # ================================================================
+      # Step 6: Run evaluation (downloads model + test data from S3)
+      # ================================================================
+      - name: Run model evaluation
+        run: python src/evaluation/model_evaluate.py
+
+      # ================================================================
+      # Step 7: Read quality gate result (written by model_evaluate.py)
+      # ================================================================
+      - name: Read quality gate result
+        id: gate
+        run: |
+          source eval_metrics.env
+          echo "passed=$QUALITY_GATE_PASSED"  >> $GITHUB_OUTPUT
+          echo "accuracy=$MODEL_ACCURACY"      >> $GITHUB_OUTPUT
+          echo "f1_fake=$MODEL_F1_FAKE"        >> $GITHUB_OUTPUT
+
+      # ================================================================
+      # Step 8: Print evaluation summary
+      # ================================================================
+      - name: Print evaluation summary
+        run: |
+          echo ""
+          echo "=========================================="
+          echo " EVALUATION RESULTS"
+          echo "=========================================="
+          echo "  Model type : ${{ env.MODEL_TYPE }}"
+          echo "  Accuracy   : ${{ steps.gate.outputs.accuracy }}  (min: 0.80)"
+          echo "  F1 (fake)  : ${{ steps.gate.outputs.f1_fake }}  (min: 0.78)"
+          echo "  Gate passed: ${{ steps.gate.outputs.passed }}"
+          echo "=========================================="
+
+      # ================================================================
+      # Step 9: Hard fail if quality gates not met — blocks deployment
+      # ================================================================
+      - name: Fail if quality gate did not pass
+        if: steps.gate.outputs.passed == 'false'
+        run: |
+          echo "::error::Quality gates FAILED — deployment is blocked."
+          echo "  Accuracy required: 0.80   got: ${{ steps.gate.outputs.accuracy }}"
+          echo "  F1 (fake) required: 0.78  got: ${{ steps.gate.outputs.f1_fake }}"
+          exit 1
+
+      # ================================================================
+      # Step 10: Save artifacts for downstream deploy job
+      # ================================================================
+      - name: Save eval metrics artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name:            eval-metrics
+          path:            eval_metrics.env
+          retention-days:  7
+
+      - name: Write model data artifact (pass-through to deploy)
+        run: |
+          printf "MODEL_DATA=%s\nMODEL_TYPE=%s\n" \
+            "${{ env.MODEL_DATA }}" "${{ env.MODEL_TYPE }}" > model_data_for_deploy.env
+
+      - name: Upload model data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name:            model-data-eval
+          path:            model_data_for_deploy.env
+          retention-days:  7
+
+      # ================================================================
+      # Step 11: Create summary
+      # ================================================================
+      - name: Create summary
+        run: |
+          echo "## Model Evaluation Complete ✓" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Results:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Model Type : \`${{ env.MODEL_TYPE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Accuracy   : \`${{ steps.gate.outputs.accuracy }}\`  (threshold: 0.80)" >> $GITHUB_STEP_SUMMARY
+          echo "- F1 (fake)  : \`${{ steps.gate.outputs.f1_fake }}\`  (threshold: 0.78)" >> $GITHUB_STEP_SUMMARY
+          echo "- Gate passed: \`${{ steps.gate.outputs.passed }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.gate.outputs.passed }}" = "true" ]; then
+            echo "**Next Step:** Run '5. Model Deploy (SageMaker Endpoint)'" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Action Required:** Retrain the model before deploying." >> $GITHUB_STEP_SUMMARY
+          fi

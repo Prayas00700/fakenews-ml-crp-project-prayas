@@ -1,0 +1,150 @@
+name: "5. Model Deploy (SageMaker Endpoint)"
+
+on:
+  workflow_run:
+    workflows: ["4. Model Evaluate"]
+    types: [completed]
+
+  workflow_dispatch:
+    inputs:
+      model_data:
+        description: 'S3 URI of the model artifact (model.tar.gz)'
+        required: true
+      model_type:
+        description: 'nb | lstm | bert'
+        required: true
+        default: 'lstm'
+        type: choice
+        options:
+          - nb
+          - lstm
+          - bert
+
+env:
+  AWS_REGION:              ${{ vars.AWS_REGION }}
+  S3_BUCKET:               ${{ secrets.S3_BUCKET }}
+  PROJECT_NAME:            ${{ vars.PROJECT_NAME }}
+  SAGEMAKER_ROLE_ARN:      ${{ secrets.SAGEMAKER_ROLE_ARN }}
+  SAGEMAKER_ENDPOINT_NAME: ${{ secrets.SAGEMAKER_ENDPOINT_NAME }}
+  ENDPOINT_INSTANCE:       ${{ vars.ENDPOINT_INSTANCE || 'ml.m5.large' }}
+
+jobs:
+  deploy:
+    name: "Deploy Model to SageMaker Endpoint"
+    runs-on: ubuntu-latest
+
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    # Require manual approval for production deployments
+    environment: production
+
+    steps:
+      # ================================================================
+      # Step 1: Checkout
+      # ================================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ================================================================
+      # Step 2: Resolve MODEL_DATA / MODEL_TYPE
+      # ================================================================
+      - name: Download model-data artifact (if chained via workflow_run)
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name:         model-data-eval
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id:       ${{ github.event.workflow_run.id }}
+
+      - name: Load MODEL_DATA from artifact
+        if: github.event_name == 'workflow_run'
+        run: |
+          source model_data_for_deploy.env
+          echo "MODEL_DATA=$MODEL_DATA" >> $GITHUB_ENV
+          echo "MODEL_TYPE=$MODEL_TYPE" >> $GITHUB_ENV
+
+      - name: Load MODEL_DATA from manual inputs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "MODEL_DATA=${{ github.event.inputs.model_data }}" >> $GITHUB_ENV
+          echo "MODEL_TYPE=${{ github.event.inputs.model_type }}" >> $GITHUB_ENV
+
+      # ================================================================
+      # Step 3: Setup Python
+      # ================================================================
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      # ================================================================
+      # Step 4: Install dependencies
+      # ================================================================
+      - name: Install dependencies
+        run: pip install boto3 sagemaker
+
+      # ================================================================
+      # Step 5: Configure AWS credentials
+      # ================================================================
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      # ================================================================
+      # Step 6: Deploy model to SageMaker endpoint
+      # ================================================================
+      - name: Deploy model to SageMaker endpoint
+        run: python src/deployment/model_deploy.py
+
+      # ================================================================
+      # Step 7: Read deployed endpoint name
+      # ================================================================
+      - name: Read deployment info
+        id: deploy_info
+        run: |
+          source deployment.env
+          echo "endpoint_name=$ENDPOINT_NAME" >> $GITHUB_OUTPUT
+          echo "model_type=$MODEL_TYPE"        >> $GITHUB_OUTPUT
+
+      # ================================================================
+      # Step 8: Print deployment summary
+      # ================================================================
+      - name: Print deployment summary
+        run: |
+          echo ""
+          echo "=========================================="
+          echo " DEPLOYMENT COMPLETE"
+          echo "=========================================="
+          echo "  Endpoint  : ${{ steps.deploy_info.outputs.endpoint_name }}"
+          echo "  Model type: ${{ steps.deploy_info.outputs.model_type }}"
+          echo "  Region    : ${{ env.AWS_REGION }}"
+          echo "=========================================="
+
+      # ================================================================
+      # Step 9: Save deployment artifact for monitoring job
+      # ================================================================
+      - name: Save deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name:            deployment-info
+          path:            deployment.env
+          retention-days:  30
+
+      # ================================================================
+      # Step 10: Create summary
+      # ================================================================
+      - name: Create summary
+        run: |
+          echo "## Model Deployment Complete ✓" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Endpoint Details:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Endpoint Name: \`${{ steps.deploy_info.outputs.endpoint_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Model Type:    \`${{ steps.deploy_info.outputs.model_type }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Region:        \`${{ env.AWS_REGION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Instance:      \`${{ env.ENDPOINT_INSTANCE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next Step:** Run '6. Monitor Pipeline' to set up Model Monitor" >> $GITHUB_STEP_SUMMARY

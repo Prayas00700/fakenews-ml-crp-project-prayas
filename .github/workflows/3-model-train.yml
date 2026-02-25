@@ -1,0 +1,270 @@
+name: "3. Model Training (SageMaker)"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# When to run
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  # Manual trigger — choose model type and hyperparameters
+  workflow_dispatch:
+    inputs:
+      model_type:
+        description: 'Model type to train'
+        required:    true
+        default:     'lstm'
+        type:        choice
+        options:
+          - nb
+          - lstm
+          - bert
+      epochs:
+        description: 'Number of training epochs'
+        required:    false
+        default:     '8'
+      batch_size:
+        description: 'Batch size'
+        required:    false
+        default:     '64'
+
+  # Auto-trigger after preprocessing completes
+  workflow_run:
+    workflows: ["2. Data Preprocessing (SageMaker)"]
+    types: [completed]
+
+  # Trigger on code changes to the training script
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/model/model_train.py'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Environment variables — ALL sourced from GitHub Secrets / Variables
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  AWS_REGION:              ${{ vars.AWS_REGION }}
+  S3_BUCKET:               ${{ secrets.S3_BUCKET }}
+  PROJECT_NAME:            ${{ vars.PROJECT_NAME }}
+  SAGEMAKER_ROLE_ARN:      ${{ secrets.SAGEMAKER_ROLE_ARN }}
+  SAGEMAKER_INSTANCE_TRAIN: ${{ vars.SAGEMAKER_INSTANCE_TRAIN || 'ml.g4dn.xlarge' }}
+  SAGEMAKER_INSTANCE:      ${{ vars.SAGEMAKER_INSTANCE       || 'ml.m5.xlarge' }}
+
+jobs:
+  train-model:
+    name: "Train Model on SageMaker"
+    runs-on: ubuntu-latest
+
+    # Only run if preprocessing succeeded (for auto-trigger)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      job-name:      ${{ steps.start-training.outputs.job_name }}
+      model-s3-uri:  ${{ steps.get-model.outputs.model_uri }}
+      model-type:    ${{ steps.start-training.outputs.model_type }}
+
+    steps:
+      # ================================================================
+      # Step 1: Checkout code
+      # ================================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ================================================================
+      # Step 2: Generate timestamp
+      # ================================================================
+      - name: Generate timestamp
+        id: timestamp
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "Generated timestamp: $TIMESTAMP"
+
+      # ================================================================
+      # Step 3: Setup Python
+      # ================================================================
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      # ================================================================
+      # Step 4: Install dependencies
+      # ================================================================
+      - name: Install dependencies
+        run: |
+          pip install boto3 sagemaker
+
+      # ================================================================
+      # Step 5: Configure AWS credentials
+      # ================================================================
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      # ================================================================
+      # Step 6: Verify processed data exists in S3
+      # ================================================================
+      - name: Verify processed data exists
+        run: |
+          echo "Checking for processed data in S3..."
+
+          FILE_COUNT=$(aws s3 ls \
+            s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/processed/ \
+            --recursive | wc -l || true)
+
+          if [ "$FILE_COUNT" -lt 1 ]; then
+            echo "ERROR: No processed data found!"
+            echo "Please run '2. Data Preprocessing' workflow first."
+            exit 1
+          fi
+
+          echo "Found $FILE_COUNT processed data file(s) — proceeding"
+
+      # ================================================================
+      # Step 7: Start SageMaker Training Job
+      # ================================================================
+      - name: Start SageMaker Training Job
+        id: start-training
+        run: |
+          python src/model/model_train.py \
+            --bucket     ${{ env.S3_BUCKET }} \
+            --prefix     ${{ env.PROJECT_NAME }} \
+            --model-type ${{ github.event.inputs.model_type || 'lstm' }} \
+            --epochs     ${{ github.event.inputs.epochs     || '8' }} \
+            --batch-size ${{ github.event.inputs.batch_size || '64' }}
+
+          # model_train.py writes model_data.env — load it into GITHUB_OUTPUT
+          source model_data.env
+          echo "job_name=$TRAINING_JOB_NAME"    >> $GITHUB_OUTPUT
+          echo "model_uri=$MODEL_DATA"           >> $GITHUB_OUTPUT
+          echo "model_type=$MODEL_TYPE"          >> $GITHUB_OUTPUT
+
+      # ================================================================
+      # Step 8: Get model artifacts URI
+      # ================================================================
+      - name: Get model artifacts
+        id: get-model
+        run: |
+          python - <<'EOF'
+          import boto3
+          import os
+
+          job_name = "${{ steps.start-training.outputs.job_name }}"
+          region   = "${{ env.AWS_REGION }}"
+
+          sagemaker = boto3.client('sagemaker', region_name=region)
+          response  = sagemaker.describe_training_job(TrainingJobName=job_name)
+          model_uri = response['ModelArtifacts']['S3ModelArtifacts']
+
+          print(f"Model saved to: {model_uri}")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"model_uri={model_uri}\n")
+
+          EOF
+
+      # ================================================================
+      # Step 9: Verify model artifacts in S3
+      # ================================================================
+      - name: Verify model artifacts
+        run: |
+          echo "Verifying model artifacts..."
+
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/models/output/ \
+            --recursive \
+            --human-readable
+
+          echo "Model artifacts verified"
+
+      # ================================================================
+      # Step 10: Download and inspect training metrics
+      # ================================================================
+      - name: Download training metrics
+        run: |
+          echo "Downloading training metrics..."
+
+          MODEL_TAR=$(aws s3 ls \
+            s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/models/output/ \
+            --recursive | grep model.tar.gz | tail -1 | awk '{print $4}')
+
+          if [ -n "$MODEL_TAR" ]; then
+            aws s3 cp s3://${{ env.S3_BUCKET }}/$MODEL_TAR ./model.tar.gz
+            tar -xzf model.tar.gz
+
+            if [ -f metrics.json ]; then
+              echo ""
+              echo "Training Metrics:"
+              cat metrics.json | python -m json.tool
+            fi
+
+            if [ -f training_history.json ]; then
+              echo ""
+              echo "Training History (last 5 epochs):"
+              cat training_history.json | python -c "
+          import json, sys
+          h = json.load(sys.stdin)
+          keys = list(h.keys())
+          n = len(h[keys[0]])
+          for i in range(max(0, n-5), n):
+              parts = [f'{k}={h[k][i]:.4f}' for k in keys if i < len(h[k])]
+              print(f'  Epoch {i+1}: ' + '  '.join(parts))
+          "
+            fi
+          fi
+
+      # ================================================================
+      # Step 11: Save model data artifact for downstream jobs
+      # ================================================================
+      - name: Save model data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name:            model-data
+          path:            model_data.env
+          retention-days:  7
+
+      # ================================================================
+      # Step 12: Create summary
+      # ================================================================
+      - name: Create summary
+        run: |
+          echo "## Model Training Complete ✓" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Job Details:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Job Name:   \`${{ steps.start-training.outputs.job_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Model Type: \`${{ github.event.inputs.model_type || 'lstm' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Timestamp:  \`${{ steps.timestamp.outputs.timestamp }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Region:     \`${{ env.AWS_REGION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Model Location:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.get-model.outputs.model_uri }}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
+          echo "1. Run '4. Model Evaluate' to check quality gates" >> $GITHUB_STEP_SUMMARY
+          echo "2. If gates pass, run '5. Model Deploy'" >> $GITHUB_STEP_SUMMARY
+
+      # ================================================================
+      # Step 13: Success message
+      # ================================================================
+      - name: Success
+        run: |
+          echo ""
+          echo "=========================================="
+          echo " TRAINING PIPELINE COMPLETE"
+          echo "=========================================="
+          echo ""
+          echo "Model trained and saved to S3!"
+          echo "Location: ${{ steps.get-model.outputs.model_uri }}"
+          echo ""
+          echo "View training job in AWS Console:"
+          echo "SageMaker → Training → Training jobs → ${{ steps.start-training.outputs.job_name }}"
+          echo ""

@@ -1,0 +1,297 @@
+name: "2. Data Preprocessing (SageMaker)"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# When to run
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  # Manual trigger
+  workflow_dispatch:
+
+  # Auto-trigger after data download completes
+  workflow_run:
+    workflows: ["1. Download Data to S3"]
+    types: [completed]
+
+  # Trigger on code changes to the preprocessing script
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/data/data_preprocess.py'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Environment variables — ALL sourced from GitHub Secrets / Variables
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  AWS_REGION:      ${{ vars.AWS_REGION }}
+  S3_BUCKET:       ${{ secrets.S3_BUCKET }}
+  PROJECT_NAME:    ${{ vars.PROJECT_NAME }}
+  SAGEMAKER_ROLE:  ${{ secrets.SAGEMAKER_ROLE_ARN }}
+
+jobs:
+  preprocess-data:
+    name: "Run Data Preprocessing on SageMaker"
+    runs-on: ubuntu-latest
+
+    # Only run if the upstream workflow succeeded (when auto-triggered)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      job-name:  ${{ steps.start-job.outputs.job_name }}
+      timestamp: ${{ steps.timestamp.outputs.timestamp }}
+
+    steps:
+      # ================================================================
+      # Step 1: Checkout code
+      # ================================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ================================================================
+      # Step 2: Generate timestamp
+      # ================================================================
+      - name: Generate timestamp
+        id: timestamp
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "Generated timestamp: $TIMESTAMP"
+
+      # ================================================================
+      # Step 3: Setup Python
+      # ================================================================
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      # ================================================================
+      # Step 4: Install dependencies
+      # ================================================================
+      - name: Install dependencies
+        run: |
+          pip install boto3 sagemaker
+
+      # ================================================================
+      # Step 5: Configure AWS credentials
+      # ================================================================
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      # ================================================================
+      # Step 6: Upload preprocessing script to S3
+      # ================================================================
+      - name: Upload preprocessing script to S3
+        run: |
+          echo "Uploading preprocessing script to S3..."
+
+          aws s3 cp src/data/data_preprocess.py \
+            s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/code/data_preprocess.py
+
+          # Also upload dep.py which is imported by the script
+          aws s3 cp dep.py \
+            s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/code/dep.py
+
+          echo "Scripts uploaded to s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/code/"
+
+      # ================================================================
+      # Step 7: Verify raw data exists in S3 before launching job
+      # ================================================================
+      - name: Verify raw data exists in S3
+        run: |
+          echo "Checking for raw data in S3..."
+
+          CSV_COUNT=$(aws s3 ls \
+            s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/raw/ \
+            --recursive | grep -c ".csv" || true)
+
+          if [ "$CSV_COUNT" -lt 2 ]; then
+            echo "ERROR: Expected at least 2 CSV files in S3 raw folder!"
+            echo "Please run '1. Download Data to S3' workflow first."
+            exit 1
+          fi
+
+          echo "Found $CSV_COUNT CSV file(s) in raw data — proceeding"
+
+      # ================================================================
+      # Step 8: Start SageMaker Processing Job
+      # ================================================================
+      - name: Start SageMaker Processing Job
+        id: start-job
+        run: |
+          python - <<'EOF'
+          import boto3
+          import json
+          import os
+
+          timestamp  = "${{ steps.timestamp.outputs.timestamp }}"
+          job_name   = f"fake-news-preprocess-{timestamp}"
+          bucket     = "${{ env.S3_BUCKET }}"
+          project    = "${{ env.PROJECT_NAME }}"
+          region     = "${{ env.AWS_REGION }}"
+          role_arn   = "${{ env.SAGEMAKER_ROLE }}"
+
+          sagemaker = boto3.client('sagemaker', region_name=region)
+
+          response = sagemaker.create_processing_job(
+              ProcessingJobName=job_name,
+              RoleArn=role_arn,
+              ProcessingInputs=[
+                  {
+                      'InputName': 'code',
+                      'S3Input': {
+                          'S3Uri':          f's3://{bucket}/{project}/code/',
+                          'LocalPath':      '/opt/ml/processing/input/code',
+                          'S3DataType':     'S3Prefix',
+                          'S3InputMode':    'File',
+                      }
+                  },
+              ],
+              ProcessingOutputConfig={
+                  'Outputs': [
+                      {
+                          'OutputName': 'processed_data',
+                          'S3Output': {
+                              'S3Uri':        f's3://{bucket}/{project}/data/processed/',
+                              'LocalPath':    '/opt/ml/processing/output',
+                              'S3UploadMode': 'EndOfJob',
+                          }
+                      }
+                  ]
+              },
+              ProcessingResources={
+                  'ClusterConfig': {
+                      'InstanceCount':   1,
+                      'InstanceType':    'ml.m5.xlarge',
+                      'VolumeSizeInGB':  20,
+                  }
+              },
+              AppSpecification={
+                  'ImageUri': f'763104351884.dkr.ecr.{region}.amazonaws.com/pytorch-training:2.0.0-cpu-py310',
+                  'ContainerEntrypoint': [
+                      'python3',
+                      '/opt/ml/processing/input/code/data_preprocess.py',
+                      '--bucket',      bucket,
+                      '--prefix',      project,
+                      '--output-path', '/opt/ml/processing/output',
+                  ]
+              },
+              StoppingCondition={
+                  'MaxRuntimeInSeconds': 3600   # 1 hour max
+              },
+              Tags=[
+                  {'Key': 'Project',   'Value': project},
+                  {'Key': 'Stage',     'Value': 'Preprocessing'},
+                  {'Key': 'Timestamp', 'Value': timestamp},
+              ]
+          )
+
+          print(f"SageMaker Processing Job started: {job_name}")
+          print(f"  ARN: {response['ProcessingJobArn']}")
+          print(f"  Instance: ml.m5.xlarge")
+          print(f"  Input:  s3://{bucket}/{project}/data/raw/")
+          print(f"  Output: s3://{bucket}/{project}/data/processed/")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"job_name={job_name}\n")
+
+          EOF
+
+      # ================================================================
+      # Step 9: Wait for Processing Job to complete
+      # ================================================================
+      - name: Wait for Processing Job
+        run: |
+          python - <<'EOF'
+          import boto3
+          import time
+
+          job_name = "${{ steps.start-job.outputs.job_name }}"
+          region   = "${{ env.AWS_REGION }}"
+
+          sagemaker = boto3.client('sagemaker', region_name=region)
+
+          print(f"Waiting for job: {job_name}")
+          print("This may take 10–20 minutes...")
+          print("")
+
+          last_status = None
+          start_time  = time.time()
+
+          while True:
+              response = sagemaker.describe_processing_job(ProcessingJobName=job_name)
+              status   = response['ProcessingJobStatus']
+
+              if status != last_status:
+                  elapsed = int(time.time() - start_time)
+                  print(f"[{elapsed}s] Status: {status}")
+                  last_status = status
+
+              if status == 'Completed':
+                  elapsed = int(time.time() - start_time)
+                  print(f"\nProcessing job completed in {elapsed}s ({elapsed/60:.1f} minutes)")
+                  break
+
+              elif status in ['Failed', 'Stopped']:
+                  reason = response.get('FailureReason', 'Unknown')
+                  print(f"\nProcessing job failed: {reason}")
+                  exit(1)
+
+              time.sleep(30)
+
+          EOF
+
+      # ================================================================
+      # Step 10: Verify processed outputs in S3
+      # ================================================================
+      - name: Verify processed data in S3
+        run: |
+          echo "Verifying processed data in S3..."
+
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/processed/ \
+            --recursive \
+            --human-readable
+
+          FILE_COUNT=$(aws s3 ls \
+            s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/processed/ \
+            --recursive | wc -l || true)
+
+          echo "Found $FILE_COUNT file(s) in processed output"
+
+          if [ "$FILE_COUNT" -lt 1 ]; then
+            echo "ERROR: No processed data files found!"
+            exit 1
+          fi
+
+          echo "Processed data verified"
+
+      # ================================================================
+      # Step 11: Create summary
+      # ================================================================
+      - name: Create summary
+        run: |
+          echo "## Data Preprocessing Complete ✓" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Job Details:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Job Name:  \`${{ steps.start-job.outputs.job_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Timestamp: \`${{ steps.timestamp.outputs.timestamp }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Instance:  \`ml.m5.xlarge\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Region:    \`${{ env.AWS_REGION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Processed Files:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/processed/ \
+            --recursive --human-readable >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next Step:** Run '3. Model Training (SageMaker)'" >> $GITHUB_STEP_SUMMARY
