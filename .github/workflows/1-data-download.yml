@@ -29,10 +29,9 @@ on:
 #   PROJECT_NAME    — e.g. fake-news
 # ─────────────────────────────────────────────────────────────────────────────
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-  S3_BUCKET: ${{ vars.S3_BUCKET }}
+  AWS_REGION:   ${{ vars.AWS_REGION }}
+  S3_BUCKET:    ${{ secrets.S3_BUCKET }}
   PROJECT_NAME: ${{ vars.PROJECT_NAME }}
-
 
 jobs:
   download-data:
@@ -95,7 +94,8 @@ jobs:
       #
       # Downloads:
       #   1. vimlendusharma/fake-or-real-news  → fake_or_real_news.csv
-      #   2. algord/fakenewsnet               → FakeNewsNet.csv
+      #   2. clmentbisaillon/fake-and-real-news-dataset
+      #      → merges Fake.csv + True.csv, injects 'label' column
       #
       # Then uploads both CSVs to:
       #   s3://<S3_BUCKET>/<PROJECT_NAME>/data/raw/
@@ -107,7 +107,7 @@ jobs:
         run: |
           echo "Downloading datasets from Kaggle..."
           echo "  Dataset 1: vimlendusharma/fake-or-real-news"
-          echo "  Dataset 2: algord/fakenewsnet"
+          echo "  Dataset 2: clmentbisaillon/fake-and-real-news-dataset (Fake.csv + True.csv → merged with labels)"
           echo ""
           echo "Uploading to s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/raw/"
 
@@ -162,7 +162,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Source Datasets:**" >> $GITHUB_STEP_SUMMARY
           echo "- \`vimlendusharma/fake-or-real-news\` → \`fake_or_real_news.csv\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`algord/fakenewsnet\` → \`FakeNewsNet.csv\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`clmentbisaillon/fake-and-real-news-dataset\` → merged from \`Fake.csv\` + \`True.csv\` with injected label column" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**S3 Details:**" >> $GITHUB_STEP_SUMMARY
           echo "- S3 Bucket:    \`${{ env.S3_BUCKET }}\`" >> $GITHUB_STEP_SUMMARY

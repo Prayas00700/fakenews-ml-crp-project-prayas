@@ -72,8 +72,13 @@ KAGGLE_DATASETS = {
         "csv_name": "fake_or_real_news.csv",       # CSV inside the zip
     },
     DATA2_FILENAME: {
+<<<<<<< HEAD:src/data/data_download.py
         "slug":     "algord/fake-news",
         "zip_name": "FakeNewsNet.zip",
+=======
+        "slug":     "algord/fakenewsnet",
+        "zip_name": "fakenewsnet.zip",
+>>>>>>> ab8e4d8 (train files):src/data/data_download-3.py
         "csv_name": "FakeNewsNet.csv",
     },
 }

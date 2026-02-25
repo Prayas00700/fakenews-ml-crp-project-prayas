@@ -356,6 +356,37 @@ SCRIPT_MAP = {
     "bert": ("train_bert.py", BERT_TRAIN_SCRIPT),
 }
 
+# requirements.txt content bundled into each model's sourcedir.tar.gz.
+# SageMaker reads this file at container start and runs `pip install -r requirements.txt`
+# before executing the training script.
+REQUIREMENTS_MAP = {
+    "nb": (
+        # scikit-learn container already has sklearn/pandas/numpy/nltk
+        "nltk\n"
+        "pandas\n"
+        "numpy\n"
+        "scikit-learn\n"
+        "pyarrow\n"         # needed to read .parquet files
+    ),
+    "lstm": (
+        # TF container already has tensorflow; just add parquet support
+        "pandas\n"
+        "numpy\n"
+        "scikit-learn\n"
+        "pyarrow\n"
+        "tensorflow>=2.13\n"
+    ),
+    "bert": (
+        # PyTorch container does NOT include transformers — this is the fix
+        "transformers>=4.35.0\n"
+        "torch>=2.0.0\n"
+        "pandas\n"
+        "numpy\n"
+        "scikit-learn\n"
+        "pyarrow\n"
+    ),
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # S3 / SageMaker helpers
@@ -369,17 +400,35 @@ def get_clients():
 
 
 def upload_training_script(s3: boto3.client, script_content: str, script_name: str,
-                            bucket: str, prefix: str) -> str:
-    """Upload the training script to S3 and return its S3 URI."""
+                            bucket: str, prefix: str, model_type: str = "bert") -> str:
+    """
+    Package the training script + a requirements.txt into a sourcedir.tar.gz
+    and upload it to S3.
+
+    SageMaker reads requirements.txt from the sourcedir and runs
+    `pip install -r requirements.txt` before executing the training entry-point.
+    This is the standard mechanism for adding extra packages (e.g. transformers)
+    to a managed container that does not ship them by default.
+    """
     import tarfile, io
 
-    # Package into sourcedir.tar.gz (SageMaker convention)
+    requirements_content = REQUIREMENTS_MAP.get(model_type, "")
+
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        # ── Add training script ──────────────────────────────────────────────
         script_bytes = script_content.encode("utf-8")
         info         = tarfile.TarInfo(name=script_name)
         info.size    = len(script_bytes)
         tar.addfile(info, io.BytesIO(script_bytes))
+
+        # ── Add requirements.txt ─────────────────────────────────────────────
+        if requirements_content:
+            req_bytes = requirements_content.encode("utf-8")
+            req_info  = tarfile.TarInfo(name="requirements.txt")
+            req_info.size = len(req_bytes)
+            tar.addfile(req_info, io.BytesIO(req_bytes))
+            logger.info("Bundled requirements.txt into sourcedir for model_type=%s", model_type)
 
     buf.seek(0)
     s3_key = f"{prefix}/code/sourcedir_{script_name.replace('.py','')}.tar.gz"
@@ -624,7 +673,8 @@ def main() -> None:
     # ── 1. Upload training script to S3 ──────────────────────────────────────
     script_name, script_content = SCRIPT_MAP[args.model_type][0], SCRIPT_MAP[args.model_type][1]
     sourcedir_uri, script_name  = upload_training_script(
-        s3, script_content, script_name, args.bucket, args.prefix
+        s3, script_content, script_name, args.bucket, args.prefix,
+        model_type=args.model_type,
     )
 
     # ── 2. Start training job ─────────────────────────────────────────────────

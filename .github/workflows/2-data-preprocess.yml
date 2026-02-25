@@ -208,6 +208,7 @@ jobs:
           print(f"  Instance: ml.m5.xlarge")
           print(f"  Input:  s3://{bucket}/{project}/data/raw/")
           print(f"  Output: s3://{bucket}/{project}/data/processed/")
+          print(f"  Datasets: fake_or_real_news.csv + isot_fake_and_real_news.csv")
 
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"job_name={job_name}\n")
@@ -288,6 +289,10 @@ jobs:
       - name: Create summary
         run: |
           echo "## Data Preprocessing Complete ✓" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Source Datasets:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`vimlendusharma/fake-or-real-news\` → \`fake_or_real_news.csv\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`clmentbisaillon/fake-and-real-news-dataset\` → merged \`Fake.csv\` + \`True.csv\` with injected labels" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Job Details:**" >> $GITHUB_STEP_SUMMARY
           echo "- Job Name:  \`${{ steps.start-job.outputs.job_name }}\`" >> $GITHUB_STEP_SUMMARY
