@@ -210,18 +210,28 @@ def clean_for_lstm(text: str) -> str:
 def prepare_df1(df: pd.DataFrame) -> pd.DataFrame:
     """
     Prepare fake_or_real_news.csv
-    Expected columns: id, title, text, label
+    Confirmed columns: title, text, label
+    (plus an unnamed index column that is dropped)
     """
     logger.info("Preparing df1 (fake_or_real_news)...")
 
-    # Drop unnamed index columns
+    # Drop unnamed index columns (e.g. 'Unnamed: 0')
     drop_cols = [c for c in df.columns if c.lower().startswith("unnamed")]
     if drop_cols:
         logger.info("  Dropping junk columns: %s", drop_cols)
         df = df.drop(columns=drop_cols)
 
-    df["title"] = df.get("title", pd.Series(dtype=str)).fillna("")
-    df["text"]  = df.get("text",  pd.Series(dtype=str)).fillna("")
+    # Validate required columns
+    missing = [c for c in ("title", "text", "label") if c not in df.columns]
+    if missing:
+        logger.error(
+            "  CRITICAL: Missing expected columns %s. Available: %s",
+            missing, list(df.columns),
+        )
+        sys.exit(1)
+
+    df["title"] = df["title"].fillna("")
+    df["text"]  = df["text"].fillna("")
 
     df["clean_text_raw"] = (df["title"].astype(str) + " " + df["text"].astype(str)).str.strip()
     df["label_norm"]     = df["label"].apply(normalize_label)
@@ -237,36 +247,29 @@ def prepare_df1(df: pd.DataFrame) -> pd.DataFrame:
 def prepare_df2(df: pd.DataFrame) -> pd.DataFrame:
     """
     Prepare FakeNewsNet.csv
-    Expected columns: title, news_url, source_domain, tweet_num, real (0/1)
+    Confirmed columns: title, news_url, source_domain, tweet_num, real
+      - 'real' is the label column (1 = real, 0 = fake)
+      - There is NO 'text' column; only 'title' is used as the text feature
     """
     logger.info("Preparing df2 (FakeNewsNet)...")
 
-    # --- ENHANCED COLUMN DETECTION ---
-    # List of common names for the label column in this dataset
-    potential_label_cols = ['real', 'label', 'class', 'target']
-    found_col = None
-    
-    for col in potential_label_cols:
-        if col in df.columns:
-            found_col = col
-            break
-    
-    if found_col:
-        if found_col != "label":
-            df = df.rename(columns={found_col: "label"})
-            logger.info(f"  Mapped column '{found_col}' -> 'label'")
-    else:
-        # If we still can't find it, log the actual columns to debug
-        logger.error(f"  CRITICAL: No label column found! Available columns: {df.columns.tolist()}")
-        raise KeyError(f"Could not find a label column in FakeNewsNet. Available: {df.columns.tolist()}")
+    # Validate required columns
+    missing = [c for c in ("title", "news_url", "source_domain", "tweet_num", "real") if c not in df.columns]
+    if missing:
+        logger.error(
+            "  CRITICAL: Missing expected columns %s. Available: %s",
+            missing, list(df.columns),
+        )
+        sys.exit(1)
 
-    # Ensure other columns exist before concatenation
-    df["title"] = df.get("title", pd.Series([""] * len(df))).fillna("")
-    df["text"]  = df.get("text",  pd.Series([""] * len(df))).fillna("")
+    # Rename 'real' → 'label'  (1 = real news, 0 = fake news)
+    df = df.rename(columns={"real": "label"})
+    logger.info("  Renamed column 'real' → 'label'")
 
-    df["clean_text_raw"] = (df["title"].astype(str) + " " + df["text"].astype(str)).str.strip()
-    
-    # Now this is safe because we ensured 'label' exists above
+    # FakeNewsNet has no body text — use title only as the text feature
+    df["title"] = df["title"].fillna("")
+    df["clean_text_raw"] = df["title"].astype(str).str.strip()
+
     df["label_norm"] = df["label"].apply(normalize_label)
 
     before = len(df)
@@ -275,7 +278,8 @@ def prepare_df2(df: pd.DataFrame) -> pd.DataFrame:
     logger.info("  Shape: %s  |  Labels: %s", df.shape, df["label_norm"].value_counts().to_dict())
 
     return df[["clean_text_raw", "label_norm"]].rename(columns={"label_norm": "label"})
-  
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Save processed outputs
 # ──────────────────────────────────────────────────────────────────────────────
