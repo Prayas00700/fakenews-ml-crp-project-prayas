@@ -33,7 +33,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-      actions: read        # Required to download artifacts from upstream workflow runs
+      actions: read        # Required for gh api cross-workflow artifact access
 
     if: >
       github.event_name == 'workflow_dispatch' ||
@@ -56,12 +56,33 @@ jobs:
       # ================================================================
       - name: Download model-data artifact (if chained via workflow_run)
         if: github.event_name == 'workflow_run'
-        uses: actions/download-artifact@v4
-        with:
-          name:         model-data
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id:       ${{ github.event.workflow_run.id }}
-          repository:   ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID:   ${{ github.event.workflow_run.id }}
+          REPO:     ${{ github.repository }}
+        run: |
+          # actions/download-artifact@v4 cannot fetch artifacts cross-workflow.
+          # Use the GitHub REST API directly — this always works.
+          echo "Fetching artifact list from run $RUN_ID..."
+
+          ARTIFACT_URL=$(gh api \
+            repos/$REPO/actions/runs/$RUN_ID/artifacts \
+            --jq '.artifacts[] | select(.name == "model-data") | .archive_download_url')
+
+          if [ -z "$ARTIFACT_URL" ]; then
+            echo "ERROR: 'model-data' artifact not found in run $RUN_ID"
+            echo "Make sure Workflow 3 completed successfully and uploaded the artifact."
+            exit 1
+          fi
+
+          echo "Downloading artifact..."
+          curl -sL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$ARTIFACT_URL" -o model-data.zip
+
+          unzip -o model-data.zip
+          echo "Artifact contents:"; ls -la model_data.env
 
       - name: Load MODEL_DATA from artifact
         if: github.event_name == 'workflow_run'
