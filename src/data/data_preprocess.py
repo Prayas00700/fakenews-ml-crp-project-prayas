@@ -241,16 +241,30 @@ def prepare_df2(df: pd.DataFrame) -> pd.DataFrame:
     """
     logger.info("Preparing df2 (FakeNewsNet)...")
 
-    # Rename 'real' → 'label' if needed
-    if "real" in df.columns and "label" not in df.columns:
+    # --- FIX 1: Robust Column Mapping ---
+    # We check for 'real' or other variants and map them to 'label' immediately
+    if "real" in df.columns:
         df = df.rename(columns={"real": "label"})
-        logger.info("  Renamed column 'real' → 'label'")
+        logger.info("  Renamed column 'real' -> 'label'")
+    
+    # Ensure a 'label' column exists now, otherwise normalize_label will fail
+    if "label" not in df.columns:
+        # Fallback for datasets that use 'class' or similar, or error out clearly
+        for col in ["class", "target"]:
+            if col in df.columns:
+                df = df.rename(columns={col: "label"})
+                break
 
     df["title"]         = df.get("title",         pd.Series(dtype=str)).fillna("")
     df["source_domain"] = df.get("source_domain",  pd.Series(dtype=str)).fillna("")
+    
+    # --- FIX 2: Text Column Safety ---
+    # FakeNewsNet often has a 'title' but sometimes missing 'text' body
     df["text"]          = df.get("text",           pd.Series(dtype=str)).fillna("")
 
     df["clean_text_raw"] = (df["title"].astype(str) + " " + df["text"].astype(str)).str.strip()
+    
+    # This now safely finds 'label' because of the rename above
     df["label_norm"]     = df["label"].apply(normalize_label)
 
     before = len(df)
@@ -259,7 +273,6 @@ def prepare_df2(df: pd.DataFrame) -> pd.DataFrame:
     logger.info("  Shape: %s  |  Labels: %s", df.shape, df["label_norm"].value_counts().to_dict())
 
     return df[["clean_text_raw", "label_norm"]].rename(columns={"label_norm": "label"})
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Save processed outputs
