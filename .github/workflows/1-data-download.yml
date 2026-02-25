@@ -29,9 +29,10 @@ on:
 #   PROJECT_NAME    — e.g. fake-news
 # ─────────────────────────────────────────────────────────────────────────────
 env:
-  AWS_REGION:   ${{ vars.AWS_REGION }}
-  S3_BUCKET:    ${{ vars.S3_BUCKET }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  S3_BUCKET: ${{ vars.S3_BUCKET }}
   PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+
 
 jobs:
   download-data:
