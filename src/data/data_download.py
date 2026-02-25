@@ -74,7 +74,7 @@ KAGGLE_DATASETS = {
 DATA2_FILENAME: {
     "slug": "clmentbisaillon/fake-and-real-news-dataset",
     "zip_name": "fake-and-real-news-dataset.zip",
-    "csv_name": None,  # because dataset extracts multiple CSV files
+    "csv_name": "Fake.csv",
 }
 }
 
