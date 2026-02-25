@@ -1,0 +1,138 @@
+name: "6. Monitor Pipeline"
+
+on:
+  workflow_run:
+    workflows: ["5. Model Deploy (SageMaker Endpoint)"]
+    types: [completed]
+
+  # Daily report check at 08:00 UTC
+  schedule:
+    - cron: '0 8 * * *'
+
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'full = setup baseline + schedule + report  |  report = fetch report only'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - report
+
+env:
+  AWS_REGION:              ${{ vars.AWS_REGION }}
+  S3_BUCKET:               ${{ secrets.S3_BUCKET }}
+  PROJECT_NAME:            ${{ vars.PROJECT_NAME }}
+  SAGEMAKER_ROLE_ARN:      ${{ secrets.SAGEMAKER_ROLE_ARN }}
+  SAGEMAKER_ENDPOINT_NAME: ${{ secrets.SAGEMAKER_ENDPOINT_NAME }}
+  ENDPOINT_INSTANCE:       ${{ vars.ENDPOINT_INSTANCE || 'ml.m5.large' }}
+
+jobs:
+  # ── Full setup: runs once after each new deployment ─────────────────────────
+  setup-monitoring:
+    name: "Setup SageMaker Model Monitor"
+    runs-on: ubuntu-latest
+
+    if: >
+      github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'full')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: pip install boto3 sagemaker pandas pyarrow
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Setup monitoring (baseline + hourly schedule)
+        env:
+          MONITOR_ACTION: full
+        run: python src/monitoring/monitor_pipeline.py
+
+      - name: Create summary
+        run: |
+          echo "## Monitoring Setup Complete ✓" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Baseline created from: \`s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/processed/\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Monitoring schedule: Hourly" >> $GITHUB_STEP_SUMMARY
+          echo "- Data capture: s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/monitoring/" >> $GITHUB_STEP_SUMMARY
+
+  # ── Daily report: fetches and logs the latest monitoring report ──────────────
+  daily-report:
+    name: "Fetch Monitoring Report & Check for Drift"
+    runs-on: ubuntu-latest
+
+    if: >
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'report')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: pip install boto3 sagemaker
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Fetch and log monitoring report
+        env:
+          MONITOR_ACTION: report
+        run: python src/monitoring/monitor_pipeline.py
+
+      - name: Check for violations in latest report
+        run: |
+          python - <<'EOF'
+          import boto3, json, os, sys
+
+          s3      = boto3.client("s3", region_name=os.environ["AWS_REGION"])
+          bucket  = os.environ["S3_BUCKET"]
+          project = os.environ["PROJECT_NAME"]
+          key     = f"{project}/metrics/monitor_report_latest.json"
+
+          try:
+              obj    = s3.get_object(Bucket=bucket, Key=key)
+              report = json.loads(obj["Body"].read())
+          except Exception:
+              print("No monitoring report found yet — skipping violation check.")
+              sys.exit(0)
+
+          violations = report.get("violations", [])
+          if violations:
+              print(f"WARNING: {len(violations)} data drift violation(s) detected!")
+              for v in violations:
+                  print(f"  {v.get('feature_name')}: {v.get('description')}")
+              # Uncomment to fail the workflow on drift and receive GitHub notification:
+              # sys.exit(1)
+          else:
+              print("No violations in latest monitoring report.")
+          EOF
+
+      - name: Create summary
+        run: |
+          echo "## Daily Monitoring Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Endpoint: \`${{ env.SAGEMAKER_ENDPOINT_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Region:   \`${{ env.AWS_REGION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Report:   \`s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/metrics/monitor_report_latest.json\`" >> $GITHUB_STEP_SUMMARY
