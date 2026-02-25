@@ -237,35 +237,37 @@ def prepare_df1(df: pd.DataFrame) -> pd.DataFrame:
 def prepare_df2(df: pd.DataFrame) -> pd.DataFrame:
     """
     Prepare FakeNewsNet.csv
-    Expected columns: title, news_url, source_domain, tweet_num, label (or 'real')
+    Expected columns: title, news_url, source_domain, tweet_num, real (0/1)
     """
     logger.info("Preparing df2 (FakeNewsNet)...")
 
-    # --- FIX 1: Robust Column Mapping ---
-    # We check for 'real' or other variants and map them to 'label' immediately
-    if "real" in df.columns:
-        df = df.rename(columns={"real": "label"})
-        logger.info("  Renamed column 'real' -> 'label'")
+    # --- ENHANCED COLUMN DETECTION ---
+    # List of common names for the label column in this dataset
+    potential_label_cols = ['real', 'label', 'class', 'target']
+    found_col = None
     
-    # Ensure a 'label' column exists now, otherwise normalize_label will fail
-    if "label" not in df.columns:
-        # Fallback for datasets that use 'class' or similar, or error out clearly
-        for col in ["class", "target"]:
-            if col in df.columns:
-                df = df.rename(columns={col: "label"})
-                break
+    for col in potential_label_cols:
+        if col in df.columns:
+            found_col = col
+            break
+    
+    if found_col:
+        if found_col != "label":
+            df = df.rename(columns={found_col: "label"})
+            logger.info(f"  Mapped column '{found_col}' -> 'label'")
+    else:
+        # If we still can't find it, log the actual columns to debug
+        logger.error(f"  CRITICAL: No label column found! Available columns: {df.columns.tolist()}")
+        raise KeyError(f"Could not find a label column in FakeNewsNet. Available: {df.columns.tolist()}")
 
-    df["title"]         = df.get("title",         pd.Series(dtype=str)).fillna("")
-    df["source_domain"] = df.get("source_domain",  pd.Series(dtype=str)).fillna("")
-    
-    # --- FIX 2: Text Column Safety ---
-    # FakeNewsNet often has a 'title' but sometimes missing 'text' body
-    df["text"]          = df.get("text",           pd.Series(dtype=str)).fillna("")
+    # Ensure other columns exist before concatenation
+    df["title"] = df.get("title", pd.Series([""] * len(df))).fillna("")
+    df["text"]  = df.get("text",  pd.Series([""] * len(df))).fillna("")
 
     df["clean_text_raw"] = (df["title"].astype(str) + " " + df["text"].astype(str)).str.strip()
     
-    # This now safely finds 'label' because of the rename above
-    df["label_norm"]     = df["label"].apply(normalize_label)
+    # Now this is safe because we ensured 'label' exists above
+    df["label_norm"] = df["label"].apply(normalize_label)
 
     before = len(df)
     df = df.dropna(subset=["label_norm"]).reset_index(drop=True)
@@ -273,7 +275,7 @@ def prepare_df2(df: pd.DataFrame) -> pd.DataFrame:
     logger.info("  Shape: %s  |  Labels: %s", df.shape, df["label_norm"].value_counts().to_dict())
 
     return df[["clean_text_raw", "label_norm"]].rename(columns={"label_norm": "label"})
-
+  
 # ──────────────────────────────────────────────────────────────────────────────
 # Save processed outputs
 # ──────────────────────────────────────────────────────────────────────────────
