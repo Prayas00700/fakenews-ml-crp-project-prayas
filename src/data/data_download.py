@@ -71,11 +71,11 @@ KAGGLE_DATASETS = {
         "zip_name": "fake-or-real-news.zip",      # zip produced by `kaggle datasets download`
         "csv_name": "fake_or_real_news.csv",       # CSV inside the zip
     },
-DATA2_FILENAME: {
-    "slug": "clmentbisaillon/fake-and-real-news-dataset",
-    "zip_name": "fake-and-real-news-dataset.zip",
-    "csv_name": "Fake.csv",
-}
+    DATA2_FILENAME: {
+        "slug":     "algord/fakenewsnet",
+        "zip_name": "fakenewsnet.zip",
+        "csv_name": "FakeNewsNet.csv",
+    },
 }
 
 
