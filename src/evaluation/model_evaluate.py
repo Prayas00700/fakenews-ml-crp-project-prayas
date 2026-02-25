@@ -109,18 +109,71 @@ def evaluate_nb(model_dir: Path, test_df: pd.DataFrame) -> dict:
 
 
 def evaluate_lstm(model_dir: Path, test_df: pd.DataFrame) -> dict:
-    import tensorflow as tf
-    from tensorflow.keras.preprocessing.sequence import pad_sequences
+    """
+    Evaluate the PyTorch BiLSTM model saved by train_lstm.py.
+    Loads lstm_model.pt + vocab.pkl + model_config.json.
+    """
+    import torch
+    import torch.nn as nn
     from sklearn.metrics import classification_report, roc_auc_score
 
-    model = tf.keras.models.load_model(str(model_dir / "lstm_model"))
-    with open(model_dir / "tokenizer.pkl", "rb") as f:
-        tokenizer = pickle.load(f)
+    # ── Reconstruct model architecture (must match train_lstm.py) ────────────
+    class BiLSTMClassifier(nn.Module):
+        def __init__(self, vocab_size, embed_dim, lstm_units, dense_units, dropout):
+            super().__init__()
+            self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+            self.lstm      = nn.LSTM(embed_dim, lstm_units, batch_first=True, bidirectional=True)
+            self.dropout   = nn.Dropout(dropout)
+            self.fc1       = nn.Linear(lstm_units * 2, dense_units)
+            self.fc2       = nn.Linear(dense_units, 1)
+            self.relu      = nn.ReLU()
+        def forward(self, x):
+            emb = self.embedding(x)
+            _, (h, _) = self.lstm(emb)
+            h = torch.cat([h[-2], h[-1]], dim=1)
+            return self.fc2(self.dropout(self.relu(self.fc1(h)))).squeeze(1)
 
-    seqs = tokenizer.texts_to_sequences(test_df["clean_lstm"].values)
-    X = pad_sequences(seqs, maxlen=MAX_LEN, padding="post", truncating="post")
+    # ── Load vocab and config ─────────────────────────────────────────────────
+    with open(model_dir / "vocab.pkl", "rb") as f:
+        word2idx = pickle.load(f)
+    with open(model_dir / "model_config.json") as f:
+        cfg = json.load(f)
+
+    max_len = cfg["max_len"]
+
+    # ── Encode and pad test texts ─────────────────────────────────────────────
+    def encode_and_pad(texts):
+        seqs = [[word2idx.get(w, 1) for w in str(t).split()[:max_len]] for t in texts]
+        padded = np.zeros((len(seqs), max_len), dtype=np.int64)
+        for i, s in enumerate(seqs):
+            padded[i, :len(s)] = s
+        return padded
+
+    X = encode_and_pad(test_df["clean_lstm"].fillna("").values)
     y = test_df["label_id"].values
-    y_prob = model.predict(X, verbose=0).ravel()
+
+    # ── Load model weights ────────────────────────────────────────────────────
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model  = BiLSTMClassifier(
+        vocab_size=cfg["vocab_size"], embed_dim=cfg["embed_dim"],
+        lstm_units=cfg["lstm_units"], dense_units=cfg["dense_units"],
+        dropout=cfg["dropout"],
+    ).to(device)
+    state = torch.load(model_dir / "lstm_model.pt", map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+
+    # ── Run inference in batches ──────────────────────────────────────────────
+    from torch.utils.data import DataLoader, TensorDataset
+    dataset = TensorDataset(torch.tensor(X, dtype=torch.long))
+    loader  = DataLoader(dataset, batch_size=64)
+    probs_list = []
+    with torch.no_grad():
+        for (xb,) in loader:
+            logits = model(xb.to(device))
+            probs_list.extend(torch.sigmoid(logits).cpu().numpy())
+
+    y_prob = np.array(probs_list)
     y_pred = (y_prob >= 0.5).astype(int)
     report = classification_report(y, y_pred, output_dict=True)
     return {
@@ -237,3 +290,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
