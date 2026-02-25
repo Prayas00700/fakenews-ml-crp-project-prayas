@@ -143,6 +143,15 @@ jobs:
 
           sagemaker = boto3.client('sagemaker', region_name=region)
 
+          # FIX: We use a shell command to install NLTK and other deps inside the container before running the script
+          shell_command = (
+              "pip install nltk pandas pyarrow && "
+              "python3 /opt/ml/processing/input/code/data_preprocess.py "
+              f"--bucket {bucket} "
+              f"--prefix {project} "
+              "--output-path /opt/ml/processing/output"
+          )
+
           response = sagemaker.create_processing_job(
               ProcessingJobName=job_name,
               RoleArn=role_arn,
@@ -179,11 +188,9 @@ jobs:
               AppSpecification={
                   'ImageUri': f'763104351884.dkr.ecr.{region}.amazonaws.com/pytorch-training:2.0.0-cpu-py310',
                   'ContainerEntrypoint': [
-                      'python3',
-                      '/opt/ml/processing/input/code/data_preprocess.py',
-                      '--bucket',      bucket,
-                      '--prefix',      project,
-                      '--output-path', '/opt/ml/processing/output',
+                      '/bin/bash',
+                      '-c',
+                      shell_command
                   ]
               },
               StoppingCondition={
