@@ -42,7 +42,7 @@ on:
 # ─────────────────────────────────────────────────────────────────────────────
 env:
   AWS_REGION:              ${{ vars.AWS_REGION }}
-  S3_BUCKET:               ${{ vars.S3_BUCKET }}
+  S3_BUCKET:               ${{ secrets.S3_BUCKET }}
   PROJECT_NAME:            ${{ vars.PROJECT_NAME }}
   SAGEMAKER_ROLE_ARN:      ${{ secrets.SAGEMAKER_ROLE_ARN }}
   SAGEMAKER_INSTANCE_TRAIN: ${{ vars.SAGEMAKER_INSTANCE_TRAIN || 'ml.g4dn.xlarge' }}

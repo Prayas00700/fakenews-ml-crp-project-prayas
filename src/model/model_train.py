@@ -150,13 +150,17 @@ NB_TRAIN_SCRIPT = textwrap.dedent("""\
 """)
 
 LSTM_TRAIN_SCRIPT = textwrap.dedent("""\
-    \"\"\"LSTM training script — runs inside SageMaker Training container.\"\"\"
-    import os, re, pickle, json, argparse, glob
+    \"\"\"Bidirectional LSTM training script — PyTorch implementation.
+    Runs inside the SageMaker PyTorch 2.0 GPU container (same as BERT).
+    Uses the PT container to avoid TensorFlow binary conflicts.
+    \"\"\"
+    import os, json, pickle, argparse, glob
     import pandas as pd, numpy as np
-    import tensorflow as tf
-    from tensorflow.keras import layers, models, callbacks
-    from tensorflow.keras.preprocessing.text import Tokenizer
-    from tensorflow.keras.preprocessing.sequence import pad_sequences
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import Dataset, DataLoader
+    from torch.optim import Adam
+    from collections import Counter
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import classification_report, roc_auc_score
 
@@ -175,7 +179,10 @@ LSTM_TRAIN_SCRIPT = textwrap.dedent("""\
     parser.add_argument("--data-dir",    type=str,   default=os.environ.get("SM_CHANNEL_TRAINING", "/opt/ml/input/data/training"))
     args = parser.parse_args()
 
-    # Load processed data
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # ── Load processed data ────────────────────────────────────────────────────
     parquet_files = glob.glob(os.path.join(args.data_dir, "*.parquet"))
     csv_files     = glob.glob(os.path.join(args.data_dir, "*.csv"))
     if parquet_files:
@@ -185,42 +192,107 @@ LSTM_TRAIN_SCRIPT = textwrap.dedent("""\
     else:
         raise FileNotFoundError(f"No parquet or CSV found in {args.data_dir}")
 
-    X = df["clean_lstm"].values
+    X = df["clean_lstm"].fillna("").values
     y = df["label_id"].values
-
     Xtr_t, Xte_t, ytr, yte = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
 
-    tokenizer = Tokenizer(num_words=args.max_vocab, oov_token="<OOV>")
-    tokenizer.fit_on_texts(Xtr_t)
-    vocab_size = min(args.max_vocab, len(tokenizer.word_index) + 1)
+    # ── Build vocabulary ───────────────────────────────────────────────────────
+    counter = Counter()
+    for text in Xtr_t:
+        counter.update(str(text).split())
+    vocab = ["<PAD>", "<UNK>"] + [w for w, _ in counter.most_common(args.max_vocab - 2)]
+    word2idx = {w: i for i, w in enumerate(vocab)}
+    vocab_size = len(vocab)
 
-    def to_pad(texts):
-        seqs = tokenizer.texts_to_sequences(texts)
-        return pad_sequences(seqs, maxlen=args.max_len, padding="post", truncating="post")
+    def encode_and_pad(texts):
+        seqs = [[word2idx.get(w, 1) for w in str(t).split()[:args.max_len]] for t in texts]
+        padded = np.zeros((len(seqs), args.max_len), dtype=np.int64)
+        for i, s in enumerate(seqs):
+            padded[i, :len(s)] = s
+        return padded
 
-    Xtr_p = to_pad(Xtr_t)
-    Xte_p = to_pad(Xte_t)
+    Xtr_p = encode_and_pad(Xtr_t)
+    Xte_p = encode_and_pad(Xte_t)
 
-    model = models.Sequential([
-        layers.Embedding(vocab_size, args.embed_dim, input_length=args.max_len),
-        layers.Bidirectional(layers.LSTM(args.lstm_units)),
-        layers.Dense(args.dense_units, activation="relu"),
-        layers.Dropout(args.dropout),
-        layers.Dense(1, activation="sigmoid"),
-    ])
-    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
-    es = callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True)
+    # ── Dataset ────────────────────────────────────────────────────────────────
+    class TextDataset(Dataset):
+        def __init__(self, X, y):
+            self.X = torch.tensor(X, dtype=torch.long)
+            self.y = torch.tensor(y, dtype=torch.float32)
+        def __len__(self): return len(self.y)
+        def __getitem__(self, i): return self.X[i], self.y[i]
 
-    history = model.fit(
-        Xtr_p, ytr,
-        validation_split=0.1,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        callbacks=[es],
-        verbose=2,
-    )
+    train_dl = DataLoader(TextDataset(Xtr_p, ytr), batch_size=args.batch_size, shuffle=True)
+    test_dl  = DataLoader(TextDataset(Xte_p, yte), batch_size=args.batch_size)
 
-    y_prob = model.predict(Xte_p, verbose=0).ravel()
+    # ── Model ──────────────────────────────────────────────────────────────────
+    class BiLSTMClassifier(nn.Module):
+        def __init__(self, vocab_size, embed_dim, lstm_units, dense_units, dropout):
+            super().__init__()
+            self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+            self.lstm      = nn.LSTM(embed_dim, lstm_units, batch_first=True, bidirectional=True)
+            self.dropout   = nn.Dropout(dropout)
+            self.fc1       = nn.Linear(lstm_units * 2, dense_units)
+            self.fc2       = nn.Linear(dense_units, 1)
+            self.relu      = nn.ReLU()
+        def forward(self, x):
+            emb = self.embedding(x)
+            _, (h, _) = self.lstm(emb)
+            h = torch.cat([h[-2], h[-1]], dim=1)   # concat fwd + bwd last hidden
+            return self.fc2(self.dropout(self.relu(self.fc1(h)))).squeeze(1)
+
+    model     = BiLSTMClassifier(vocab_size, args.embed_dim, args.lstm_units, args.dense_units, args.dropout).to(device)
+    optimizer = Adam(model.parameters())
+    criterion = nn.BCEWithLogitsLoss()
+
+    # ── Training loop ──────────────────────────────────────────────────────────
+    history = {"loss": [], "val_loss": []}
+    best_val_loss, patience_count, best_state = float("inf"), 0, None
+
+    val_size  = max(1, int(0.1 * len(train_dl.dataset)))
+    train_size = len(train_dl.dataset) - val_size
+    tr_set, va_set = torch.utils.data.random_split(train_dl.dataset, [train_size, val_size])
+    tr_dl2 = DataLoader(tr_set, batch_size=args.batch_size, shuffle=True)
+    va_dl2 = DataLoader(va_set, batch_size=args.batch_size)
+
+    for epoch in range(args.epochs):
+        model.train(); tr_loss = 0
+        for xb, yb in tr_dl2:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(xb), yb)
+            loss.backward(); optimizer.step()
+            tr_loss += loss.item()
+        tr_loss /= len(tr_dl2)
+
+        model.eval(); va_loss = 0
+        with torch.no_grad():
+            for xb, yb in va_dl2:
+                va_loss += criterion(model(xb.to(device)), yb.to(device)).item()
+        va_loss /= len(va_dl2)
+
+        history["loss"].append(tr_loss)
+        history["val_loss"].append(va_loss)
+        print(f"Epoch {epoch+1}/{args.epochs}  loss={tr_loss:.4f}  val_loss={va_loss:.4f}")
+
+        if va_loss < best_val_loss:
+            best_val_loss, patience_count = va_loss, 0
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            patience_count += 1
+            if patience_count >= 3:
+                print("Early stopping triggered"); break
+
+    if best_state:
+        model.load_state_dict(best_state)
+
+    # ── Evaluation ─────────────────────────────────────────────────────────────
+    model.eval(); probs_list = []
+    with torch.no_grad():
+        for xb, _ in test_dl:
+            logits = model(xb.to(device))
+            probs_list.extend(torch.sigmoid(logits).cpu().numpy())
+    y_prob = np.array(probs_list)
     y_pred = (y_prob >= 0.5).astype(int)
     report = classification_report(yte, y_pred, output_dict=True)
     metrics = {
@@ -230,18 +302,23 @@ LSTM_TRAIN_SCRIPT = textwrap.dedent("""\
         "f1_fake":         float(report["1"]["f1-score"]),
         "precision_fake":  float(report["1"]["precision"]),
         "recall_fake":     float(report["1"]["recall"]),
-        "total_epochs":    len(history.history["loss"]),
+        "total_epochs":    len(history["loss"]),
     }
     print(f"Accuracy: {metrics['accuracy']:.4f}")
     print(f"AUC: {metrics['auc']:.4f}")
     print(f"F1-Fake: {metrics['f1_fake']:.4f}")
 
+    # ── Save artifacts ─────────────────────────────────────────────────────────
     os.makedirs(args.model_dir, exist_ok=True)
-    model.save(os.path.join(args.model_dir, "lstm_model"))
-    with open(os.path.join(args.model_dir, "tokenizer.pkl"), "wb") as f:
-        pickle.dump(tokenizer, f)
+    torch.save(best_state or model.state_dict(), os.path.join(args.model_dir, "lstm_model.pt"))
+    with open(os.path.join(args.model_dir, "vocab.pkl"), "wb") as f:
+        pickle.dump(word2idx, f)
+    with open(os.path.join(args.model_dir, "model_config.json"), "w") as f:
+        json.dump({"vocab_size": vocab_size, "embed_dim": args.embed_dim,
+                   "lstm_units": args.lstm_units, "dense_units": args.dense_units,
+                   "dropout": args.dropout, "max_len": args.max_len}, f, indent=2)
     with open(os.path.join(args.model_dir, "training_history.json"), "w") as f:
-        json.dump({k: [float(v) for v in vs] for k, vs in history.history.items()}, f, indent=2)
+        json.dump(history, f, indent=2)
     with open(os.path.join(args.model_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
     print(f"Model saved to {args.model_dir}")
@@ -356,30 +433,32 @@ SCRIPT_MAP = {
     "bert": ("train_bert.py", BERT_TRAIN_SCRIPT),
 }
 
-# requirements.txt content bundled into each model's sourcedir.tar.gz.
-# SageMaker reads this file at container start and runs `pip install -r requirements.txt`
-# before executing the training script.
+# Per-model requirements bundled into sourcedir.tar.gz.
+# SageMaker auto-runs `pip install -r requirements.txt` before the entry-point.
+#
+# IMPORTANT rules:
+#   - Never list tensorflow here — reinstalling TF inside the managed TF
+#     container clobbers pre-compiled kernels and causes symbol errors.
+#   - Never list torch here for lstm/bert — the PT container already has it.
+#   - Only add packages genuinely missing from the managed container.
 REQUIREMENTS_MAP = {
     "nb": (
-        # scikit-learn container already has sklearn/pandas/numpy/nltk
         "nltk\n"
         "pandas\n"
         "numpy\n"
         "scikit-learn\n"
-        "pyarrow\n"         # needed to read .parquet files
+        "pyarrow\n"
     ),
     "lstm": (
-        # TF container already has tensorflow; just add parquet support
+        # PyTorch container — torch is pre-installed, only add extras
         "pandas\n"
         "numpy\n"
         "scikit-learn\n"
         "pyarrow\n"
-        "tensorflow>=2.13\n"
     ),
     "bert": (
-        # PyTorch container does NOT include transformers — this is the fix
+        # PyTorch container does NOT ship transformers — must install it
         "transformers>=4.35.0\n"
-        "torch>=2.0.0\n"
         "pandas\n"
         "numpy\n"
         "scikit-learn\n"
@@ -400,15 +479,15 @@ def get_clients():
 
 
 def upload_training_script(s3: boto3.client, script_content: str, script_name: str,
-                            bucket: str, prefix: str, model_type: str = "bert") -> str:
+                            bucket: str, prefix: str, model_type: str = "lstm") -> str:
     """
-    Package the training script + a requirements.txt into a sourcedir.tar.gz
+    Package the training script + requirements.txt into a sourcedir.tar.gz
     and upload it to S3.
 
-    SageMaker reads requirements.txt from the sourcedir and runs
-    `pip install -r requirements.txt` before executing the training entry-point.
-    This is the standard mechanism for adding extra packages (e.g. transformers)
-    to a managed container that does not ship them by default.
+    SageMaker reads requirements.txt from the sourcedir at container startup
+    and runs `pip install -r requirements.txt` before the entry-point.
+    Only packages absent from the managed container are listed — critically,
+    tensorflow and torch are never reinstalled to avoid binary conflicts.
     """
     import tarfile, io
 
@@ -416,13 +495,13 @@ def upload_training_script(s3: boto3.client, script_content: str, script_name: s
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        # ── Add training script ──────────────────────────────────────────────
+        # ── Training script ──────────────────────────────────────────────────
         script_bytes = script_content.encode("utf-8")
         info         = tarfile.TarInfo(name=script_name)
         info.size    = len(script_bytes)
         tar.addfile(info, io.BytesIO(script_bytes))
 
-        # ── Add requirements.txt ─────────────────────────────────────────────
+        # ── requirements.txt ─────────────────────────────────────────────────
         if requirements_content:
             req_bytes = requirements_content.encode("utf-8")
             req_info  = tarfile.TarInfo(name="requirements.txt")
@@ -493,7 +572,7 @@ def start_training_job(
         image    = SKLEARN_IMAGE
         instance = SAGEMAKER_INSTANCE     # CPU is fine for NB
     elif model_type == "lstm":
-        image    = TF_GPU_IMAGE
+        image    = PT_GPU_IMAGE          # PyTorch container: no TF binary conflicts
         instance = SAGEMAKER_INSTANCE_TRAIN
     else:   # bert
         image    = PT_GPU_IMAGE
