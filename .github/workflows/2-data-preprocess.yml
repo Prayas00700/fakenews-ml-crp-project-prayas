@@ -77,7 +77,7 @@ jobs:
       # ================================================================
       - name: Install dependencies
         run: |
-          pip install boto3 sagemaker
+          pip install boto3 sagemaker nltk
 
       # ================================================================
       # Step 5: Configure AWS credentials
