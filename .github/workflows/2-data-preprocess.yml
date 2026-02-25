@@ -24,7 +24,7 @@ on:
 # ─────────────────────────────────────────────────────────────────────────────
 env:
   AWS_REGION:      ${{ vars.AWS_REGION }}
-  S3_BUCKET:       ${{ secrets.S3_BUCKET }}
+  S3_BUCKET:       ${{ vars.S3_BUCKET }}
   PROJECT_NAME:    ${{ vars.PROJECT_NAME }}
   SAGEMAKER_ROLE:  ${{ secrets.SAGEMAKER_ROLE_ARN }}
 
@@ -139,7 +139,7 @@ jobs:
           bucket     = "${{ env.S3_BUCKET }}"
           project    = "${{ env.PROJECT_NAME }}"
           region     = "${{ env.AWS_REGION }}"
-          role_arn   = "${{ env.SAGEMAKER_ROLE }}"
+          role_arn   = "${{ secrets.SAGEMAKER_ROLE_ARN }}"
 
           sagemaker = boto3.client('sagemaker', region_name=region)
 
