@@ -17,15 +17,25 @@ on:
 # ─────────────────────────────────────────────────────────────────────────────
 # Environment variables — ALL sourced from GitHub Secrets / Variables
 # Set these in:  Settings → Secrets and variables → Actions
+#
+# Required Secrets:
+#   S3_BUCKET       — e.g. fake-news-mlops-bucket
+#   AWS_ROLE_ARN    — OIDC role ARN for AWS auth
+#   KAGGLE_USERNAME — your Kaggle account username
+#   KAGGLE_KEY      — your Kaggle API key (from kaggle.com → Account → API)
+#
+# Required Variables:
+#   AWS_REGION      — e.g. ap-south-1
+#   PROJECT_NAME    — e.g. fake-news
 # ─────────────────────────────────────────────────────────────────────────────
 env:
-  AWS_REGION:   ${{ vars.AWS_REGION }}        # e.g. ap-south-1
-  S3_BUCKET:    ${{ secrets.S3_BUCKET }}      # e.g. fake-news-mlops-bucket
-  PROJECT_NAME: ${{ vars.PROJECT_NAME }}      # e.g. fake-news
+  AWS_REGION:   ${{ vars.AWS_REGION }}
+  S3_BUCKET:    ${{ secrets.S3_BUCKET }}
+  PROJECT_NAME: ${{ vars.PROJECT_NAME }}
 
 jobs:
   download-data:
-    name: "Upload Fake News Datasets to S3"
+    name: "Download from Kaggle & Upload to S3"
     runs-on: ubuntu-latest
 
     permissions:
@@ -52,7 +62,7 @@ jobs:
       # ================================================================
       - name: Install dependencies
         run: |
-          pip install pandas boto3
+          pip install pandas boto3 kaggle
 
       # ================================================================
       # Step 4: Configure AWS credentials (OIDC — no long-lived keys)
@@ -64,38 +74,48 @@ jobs:
           aws-region:     ${{ env.AWS_REGION }}
 
       # ================================================================
-      # Step 5: Verify local CSV files exist in the repo
+      # Step 5: Set up Kaggle API credentials
+      #
+      # The kaggle CLI looks for credentials in ~/.kaggle/kaggle.json
+      # We build that file from GitHub secrets here.
       # ================================================================
-      - name: Verify local data files
+      - name: Configure Kaggle credentials
         run: |
-          echo "Checking for required CSV files in data/local/..."
-
-          for FILE in "fake_or_real_news.csv" "FakeNewsNet.csv"; do
-            if [ ! -f "data/local/$FILE" ]; then
-              echo "ERROR: data/local/$FILE not found!"
-              echo "Please commit your CSV files to data/local/ before running this workflow."
-              exit 1
-            fi
-            SIZE=$(du -sh "data/local/$FILE" | cut -f1)
-            echo "  Found: data/local/$FILE  ($SIZE)"
-          done
-
-          echo "All required files found"
+          mkdir -p ~/.kaggle
+          echo '{
+            "username": "${{ secrets.KAGGLE_USERNAME }}",
+            "key": "${{ secrets.KAGGLE_KEY }}"
+          }' > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+          echo "Kaggle credentials configured"
 
       # ================================================================
-      # Step 6: Upload datasets to S3
-      # (creates bucket + folder structure if they don't exist)
+      # Step 6: Download datasets from Kaggle and upload to S3
+      #
+      # Downloads:
+      #   1. vimlendusharma/fake-or-real-news  → fake_or_real_news.csv
+      #   2. algord/fakenewsnet               → FakeNewsNet.csv
+      #
+      # Then uploads both CSVs to:
+      #   s3://<S3_BUCKET>/<PROJECT_NAME>/data/raw/
       # ================================================================
-      - name: Upload datasets to S3
+      - name: Download from Kaggle & Upload to S3
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY }}
         run: |
-          echo "Uploading datasets to s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/raw/"
+          echo "Downloading datasets from Kaggle..."
+          echo "  Dataset 1: vimlendusharma/fake-or-real-news"
+          echo "  Dataset 2: algord/fakenewsnet"
+          echo ""
+          echo "Uploading to s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/raw/"
 
           python src/data/data_download.py \
-            --bucket   ${{ env.S3_BUCKET }} \
-            --project  ${{ env.PROJECT_NAME }} \
-            --data-dir data/local
+            --bucket       ${{ env.S3_BUCKET }} \
+            --project      ${{ env.PROJECT_NAME }} \
+            --download-dir /tmp/kaggle_data
 
-          echo "Upload complete"
+          echo "Download and upload complete"
 
       # ================================================================
       # Step 7: Verify upload
@@ -135,11 +155,15 @@ jobs:
       # ================================================================
       - name: Create summary
         run: |
-          echo "## Data Upload Summary 📊" >> $GITHUB_STEP_SUMMARY
+          echo "## Data Download & Upload Summary 📊" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Datasets uploaded successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "Datasets downloaded from **Kaggle** and uploaded to **S3** successfully!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Details:**" >> $GITHUB_STEP_SUMMARY
+          echo "**Source Datasets:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`vimlendusharma/fake-or-real-news\` → \`fake_or_real_news.csv\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`algord/fakenewsnet\` → \`FakeNewsNet.csv\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**S3 Details:**" >> $GITHUB_STEP_SUMMARY
           echo "- S3 Bucket:    \`${{ env.S3_BUCKET }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Project:      \`${{ env.PROJECT_NAME }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Region:       \`${{ env.AWS_REGION }}\`" >> $GITHUB_STEP_SUMMARY
