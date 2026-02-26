@@ -1,0 +1,6 @@
+env:
+  AWS_REGION:   ${{ vars.AWS_REGION }}
+  S3_BUCKET:    ${{ secrets.S3_BUCKET }}
+  PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+  MODEL_DATA:   ""        # set at runtime via $GITHUB_ENV
+  MODEL_TYPE:   ""        # set at runtime via $GITHUB_ENV
