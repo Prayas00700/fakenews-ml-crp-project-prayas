@@ -1,4 +1,3 @@
-
 name: "4. Model Evaluate"
 
 on:
@@ -114,7 +113,11 @@ jobs:
       - name: Install base dependencies
         run: pip install boto3 pandas numpy pyarrow scikit-learn
 
-      - name: Install PyTorch (lstm only)
+      - name: Install TensorFlow (lstm — covers TF/Keras artifacts)
+        if: env.MODEL_TYPE == 'lstm'
+        run: pip install tensorflow
+
+      - name: Install PyTorch (lstm — covers PyTorch artifacts)
         if: env.MODEL_TYPE == 'lstm'
         run: pip install torch
 

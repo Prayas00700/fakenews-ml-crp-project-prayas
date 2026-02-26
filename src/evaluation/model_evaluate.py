@@ -107,14 +107,80 @@ def evaluate_nb(model_dir: Path, test_df: pd.DataFrame) -> dict:
     }
 
 
-def evaluate_lstm(model_dir: Path, test_df: pd.DataFrame) -> dict:
+def _detect_lstm_backend(model_dir: Path) -> str:
     """
-    Pure-PyTorch LSTM evaluation.
-    Expects in model_dir:
-      - lstm_model.pt        saved via torch.save(model.state_dict(), ...)
-      - lstm_model_arch.pkl  dict: {vocab_size, embed_dim, hidden_dim, num_layers}
-      - tokenizer.pkl        word-index dict {word: int}
+    Inspect model_dir contents and return 'pytorch' or 'tensorflow'.
+
+    PyTorch layout  : lstm_model.pt  + lstm_model_arch.pkl + tokenizer.pkl
+    TF/Keras layout : lstm_model.h5 OR saved_model.pb     + tokenizer.pkl
+                      (tokenizer may also be tokenizer.json for keras)
     """
+    if (model_dir / "lstm_model.pt").exists() and (model_dir / "lstm_model_arch.pkl").exists():
+        log.info("Detected PyTorch LSTM artifact.")
+        return "pytorch"
+
+    tf_indicators = ["lstm_model.h5", "saved_model.pb", "keras_metadata.pb"]
+    if any((model_dir / f).exists() for f in tf_indicators):
+        log.info("Detected TensorFlow/Keras LSTM artifact.")
+        return "tensorflow"
+
+    # Last-resort: list what is actually there so the user can diagnose easily
+    contents = sorted(str(p.relative_to(model_dir)) for p in model_dir.rglob("*") if p.is_file())
+    raise FileNotFoundError(
+        "Cannot determine LSTM backend from model_dir contents.\n"
+        f"Files found:\n  " + "\n  ".join(contents) + "\n\n"
+        "Expected either:\n"
+        "  [PyTorch]     lstm_model.pt + lstm_model_arch.pkl + tokenizer.pkl\n"
+        "  [TF/Keras]    lstm_model.h5 (or saved_model.pb)  + tokenizer.pkl"
+    )
+
+
+def _texts_to_padded(texts, word_index: dict, max_len: int) -> np.ndarray:
+    seqs   = [[word_index.get(w, 1) for w in t.split()] for t in texts]
+    padded = np.zeros((len(seqs), max_len), dtype=np.int64)
+    for i, s in enumerate(seqs):
+        length = min(len(s), max_len)
+        padded[i, :length] = s[:length]
+    return padded
+
+
+def _load_tokenizer(model_dir: Path) -> dict:
+    """
+    Load word-index tokenizer saved as either:
+      - tokenizer.pkl   (pickle dict  {word: int})
+      - tokenizer.json  (Keras JSON — requires tensorflow/keras to parse)
+    Returns a plain Python dict {word: int}.
+    """
+    pkl_path  = model_dir / "tokenizer.pkl"
+    json_path = model_dir / "tokenizer.json"
+
+    if pkl_path.exists():
+        with open(pkl_path, "rb") as f:
+            obj = pickle.load(f)
+        # Support both a raw dict and a Keras Tokenizer object stored as pickle
+        if isinstance(obj, dict):
+            return obj
+        # Keras Tokenizer pickled directly
+        if hasattr(obj, "word_index"):
+            return obj.word_index
+        raise ValueError(f"tokenizer.pkl has unexpected type: {type(obj)}")
+
+    if json_path.exists():
+        try:
+            from tensorflow.keras.preprocessing.text import tokenizer_from_json
+        except ImportError:
+            from keras.preprocessing.text import tokenizer_from_json
+        with open(json_path) as f:
+            tok = tokenizer_from_json(f.read())
+        return tok.word_index
+
+    raise FileNotFoundError(
+        "No tokenizer found in model_dir. "
+        "Expected tokenizer.pkl or tokenizer.json."
+    )
+
+
+def _evaluate_lstm_pytorch(model_dir: Path, test_df: pd.DataFrame) -> dict:
     import torch
     import torch.nn as nn
     from sklearn.metrics import classification_report, roc_auc_score
@@ -140,18 +206,8 @@ def evaluate_lstm(model_dir: Path, test_df: pd.DataFrame) -> dict:
     model.load_state_dict(torch.load(model_dir / "lstm_model.pt", map_location="cpu"))
     model.eval()
 
-    with open(model_dir / "tokenizer.pkl", "rb") as f:
-        word_index = pickle.load(f)
-
-    def texts_to_padded(texts, word_index, max_len):
-        seqs   = [[word_index.get(w, 1) for w in t.split()] for t in texts]
-        padded = np.zeros((len(seqs), max_len), dtype=np.int64)
-        for i, s in enumerate(seqs):
-            length = min(len(s), max_len)
-            padded[i, :length] = s[:length]
-        return padded
-
-    X = texts_to_padded(test_df["clean_lstm"].values, word_index, MAX_LEN)
+    word_index = _load_tokenizer(model_dir)
+    X = _texts_to_padded(test_df["clean_lstm"].values, word_index, MAX_LEN)
     y = test_df["label_id"].values
 
     all_probs  = []
@@ -173,6 +229,67 @@ def evaluate_lstm(model_dir: Path, test_df: pd.DataFrame) -> dict:
         "precision_fake": report["1"]["precision"],
         "recall_fake":    report["1"]["recall"],
     }
+
+
+def _evaluate_lstm_tensorflow(model_dir: Path, test_df: pd.DataFrame) -> dict:
+    """
+    Evaluate a TF/Keras LSTM model.
+    Supports:
+      - lstm_model.h5          (single-file SavedModel / legacy HDF5)
+      - <model_dir>/           (TF SavedModel directory with saved_model.pb)
+    """
+    from sklearn.metrics import classification_report, roc_auc_score
+
+    try:
+        import tensorflow as tf
+    except ImportError as exc:
+        raise ImportError(
+            "TensorFlow is required to evaluate this model artifact but is not installed.\n"
+            "Add `pip install tensorflow` to the 'Install dependencies' step in your workflow, "
+            "or re-train the model with the PyTorch trainer."
+        ) from exc
+
+    # Locate the model file / directory
+    h5_path = model_dir / "lstm_model.h5"
+    if h5_path.exists():
+        log.info("Loading Keras model from %s", h5_path)
+        model = tf.keras.models.load_model(str(h5_path))
+    elif (model_dir / "saved_model.pb").exists():
+        log.info("Loading TF SavedModel from %s", model_dir)
+        model = tf.keras.models.load_model(str(model_dir))
+    else:
+        raise FileNotFoundError("TF model file not found (expected lstm_model.h5 or saved_model.pb).")
+
+    word_index = _load_tokenizer(model_dir)
+    X = _texts_to_padded(test_df["clean_lstm"].values, word_index, MAX_LEN)
+    y = test_df["label_id"].values
+
+    log.info("Running TF inference on %d samples...", len(X))
+    y_prob = model.predict(X, batch_size=64, verbose=0).flatten()
+    y_pred = (y_prob >= 0.5).astype(int)
+    report = classification_report(y, y_pred, output_dict=True)
+    return {
+        "model_type":     "lstm",
+        "accuracy":       report["accuracy"],
+        "auc":            float(roc_auc_score(y, y_prob)),
+        "f1_fake":        report["1"]["f1-score"],
+        "precision_fake": report["1"]["precision"],
+        "recall_fake":    report["1"]["recall"],
+    }
+
+
+def evaluate_lstm(model_dir: Path, test_df: pd.DataFrame) -> dict:
+    """
+    Auto-detect whether the LSTM artifact was produced by PyTorch or TF/Keras
+    and dispatch to the appropriate evaluator.
+
+    PyTorch layout  : lstm_model.pt  + lstm_model_arch.pkl + tokenizer.pkl
+    TF/Keras layout : lstm_model.h5 (or saved_model.pb)   + tokenizer.pkl / tokenizer.json
+    """
+    backend = _detect_lstm_backend(model_dir)
+    if backend == "pytorch":
+        return _evaluate_lstm_pytorch(model_dir, test_df)
+    return _evaluate_lstm_tensorflow(model_dir, test_df)
 
 
 def evaluate_bert(model_dir: Path, test_df: pd.DataFrame) -> dict:
