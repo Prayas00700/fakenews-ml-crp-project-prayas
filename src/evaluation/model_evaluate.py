@@ -109,18 +109,64 @@ def evaluate_nb(model_dir: Path, test_df: pd.DataFrame) -> dict:
 
 
 def evaluate_lstm(model_dir: Path, test_df: pd.DataFrame) -> dict:
-    import tensorflow as tf
-    from tensorflow.keras.preprocessing.sequence import pad_sequences
+    """
+    PyTorch LSTM evaluation.
+    Expects the model directory to contain:
+      - lstm_model.pt       (saved via torch.save(model.state_dict(), ...))
+      - lstm_model_arch.pkl (pickled dict with vocab_size, embed_dim, hidden_dim, num_layers)
+      - tokenizer.pkl       (word-index dict  {word: idx})
+    """
+    import torch
+    import torch.nn as nn
     from sklearn.metrics import classification_report, roc_auc_score
 
-    model = tf.keras.models.load_model(str(model_dir / "lstm_model"))
-    with open(model_dir / "tokenizer.pkl", "rb") as f:
-        tokenizer = pickle.load(f)
+    # ── Rebuild architecture ──────────────────────────────────────────
+    with open(model_dir / "lstm_model_arch.pkl", "rb") as f:
+        arch = pickle.load(f)
 
-    seqs = tokenizer.texts_to_sequences(test_df["clean_lstm"].values)
-    X = pad_sequences(seqs, maxlen=MAX_LEN, padding="post", truncating="post")
+    class LSTMClassifier(nn.Module):
+        def __init__(self, vocab_size, embed_dim, hidden_dim, num_layers):
+            super().__init__()
+            self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+            self.lstm      = nn.LSTM(embed_dim, hidden_dim, num_layers,
+                                     batch_first=True, bidirectional=True)
+            self.fc        = nn.Linear(hidden_dim * 2, 1)
+
+        def forward(self, x):
+            emb = self.embedding(x)
+            _, (h, _) = self.lstm(emb)
+            h = torch.cat([h[-2], h[-1]], dim=1)   # bidirectional last hidden
+            return torch.sigmoid(self.fc(h)).squeeze(1)
+
+    model = LSTMClassifier(**arch)
+    model.load_state_dict(torch.load(model_dir / "lstm_model.pt", map_location="cpu"))
+    model.eval()
+
+    # ── Tokenise & pad ────────────────────────────────────────────────
+    with open(model_dir / "tokenizer.pkl", "rb") as f:
+        word_index = pickle.load(f)   # {word: int}
+
+    def texts_to_padded(texts, word_index, max_len):
+        seqs = [[word_index.get(w, 1) for w in t.split()] for t in texts]
+        padded = np.zeros((len(seqs), max_len), dtype=np.int64)
+        for i, s in enumerate(seqs):
+            length = min(len(s), max_len)
+            padded[i, :length] = s[:length]
+        return padded
+
+    X = texts_to_padded(test_df["clean_lstm"].values, word_index, MAX_LEN)
     y = test_df["label_id"].values
-    y_prob = model.predict(X, verbose=0).ravel()
+
+    # ── Inference in batches ──────────────────────────────────────────
+    batch_size = 64
+    all_probs  = []
+    with torch.no_grad():
+        for start in range(0, len(X), batch_size):
+            batch = torch.tensor(X[start:start + batch_size])
+            probs = model(batch).cpu().numpy()
+            all_probs.extend(probs)
+
+    y_prob = np.array(all_probs)
     y_pred = (y_prob >= 0.5).astype(int)
     report = classification_report(y, y_pred, output_dict=True)
     return {
