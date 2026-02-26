@@ -33,6 +33,10 @@ jobs:
     name: "Deploy Model to SageMaker Endpoint"
     runs-on: ubuntu-latest
 
+    permissions:
+      id-token: write  # Required for OIDC/STS
+      contents: read   # Required for checkout
+      
     if: >
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
