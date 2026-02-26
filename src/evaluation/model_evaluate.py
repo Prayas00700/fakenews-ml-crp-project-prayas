@@ -185,8 +185,8 @@ def _evaluate_lstm_pytorch(model_dir: Path, test_df: pd.DataFrame) -> dict:
     import torch.nn as nn
     from sklearn.metrics import classification_report, roc_auc_score
 
-    with open(model_dir / "lstm_model_arch.pkl", "rb") as f:
-        arch = pickle.load(f)
+    arch = _load_lstm_arch(model_dir)
+    log.info("Loaded LSTM arch: %s", arch)
 
     class LSTMClassifier(nn.Module):
         def __init__(self, vocab_size, embed_dim, hidden_dim, num_layers):
