@@ -25,11 +25,18 @@ env:
   AWS_REGION:   ${{ vars.AWS_REGION }}
   S3_BUCKET:    ${{ secrets.S3_BUCKET }}
   PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+  MODEL_DATA:   ""   # set at runtime via $GITHUB_ENV
+  MODEL_TYPE:   ""   # set at runtime via $GITHUB_ENV
 
 jobs:
   evaluate:
     name: "Evaluate Model & Check Quality Gates"
     runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+      actions:  read   # required for gh api cross-workflow artifact access
 
     if: >
       github.event_name == 'workflow_dispatch' ||
@@ -52,11 +59,33 @@ jobs:
       # ================================================================
       - name: Download model-data artifact (if chained via workflow_run)
         if: github.event_name == 'workflow_run'
-        uses: actions/download-artifact@v4
-        with:
-          name:         model-data
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id:       ${{ github.event.workflow_run.id }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID:   ${{ github.event.workflow_run.id }}
+          REPO:     ${{ github.repository }}
+        run: |
+          # actions/download-artifact@v4 cannot fetch cross-workflow artifacts.
+          # Use the GitHub REST API directly instead.
+          echo "Fetching artifact list from run $RUN_ID..."
+
+          ARTIFACT_URL=$(gh api \
+            repos/$REPO/actions/runs/$RUN_ID/artifacts \
+            --jq '.artifacts[] | select(.name == "model-data") | .archive_download_url')
+
+          if [ -z "$ARTIFACT_URL" ]; then
+            echo "ERROR: 'model-data' artifact not found in run $RUN_ID"
+            echo "Make sure Workflow 3 completed successfully and uploaded the artifact."
+            exit 1
+          fi
+
+          echo "Downloading artifact..."
+          curl -sL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$ARTIFACT_URL" -o model-data.zip
+
+          unzip -o model-data.zip
+          echo "Artifact contents:"; ls -la model_data.env
 
       - name: Load MODEL_DATA from artifact
         if: github.event_name == 'workflow_run'
@@ -85,9 +114,9 @@ jobs:
       - name: Install base dependencies
         run: pip install boto3 pandas numpy pyarrow scikit-learn
 
-      - name: Install TensorFlow (lstm only)
+      - name: Install PyTorch (lstm only)
         if: env.MODEL_TYPE == 'lstm'
-        run: pip install tensorflow
+        run: pip install torch
 
       - name: Install PyTorch + Transformers (bert only)
         if: env.MODEL_TYPE == 'bert'
@@ -185,3 +214,4 @@ jobs:
           else
             echo "**Action Required:** Retrain the model before deploying." >> $GITHUB_STEP_SUMMARY
           fi
+          
