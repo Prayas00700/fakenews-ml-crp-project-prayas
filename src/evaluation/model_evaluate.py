@@ -136,7 +136,7 @@ def _detect_lstm_backend(model_dir: Path) -> str:
 
 
 def _texts_to_padded(texts, word_index: dict, max_len: int) -> np.ndarray:
-    seqs   = [[word_index.get(w, 1) for w in t.split()] for t in texts]
+    seqs   = [[word_index.get(w, 1) for w in str(t).split()] for t in texts]
     padded = np.zeros((len(seqs), max_len), dtype=np.int64)
     for i, s in enumerate(seqs):
         length = min(len(s), max_len)
@@ -151,19 +151,16 @@ def _load_tokenizer(model_dir: Path) -> dict:
       - tokenizer.json  (Keras JSON — requires tensorflow/keras to parse)
     Returns a plain Python dict {word: int}.
     """
-    pkl_path  = model_dir / "tokenizer.pkl"
+    # UPDATED: Matches vocab.pkl from your log
+    pkl_path  = model_dir / "vocab.pkl"
+    tokenizer_pkl = model_dir / "tokenizer.pkl"
     json_path = model_dir / "tokenizer.json"
 
-    if pkl_path.exists():
-        with open(pkl_path, "rb") as f:
-            obj = pickle.load(f)
-        # Support both a raw dict and a Keras Tokenizer object stored as pickle
-        if isinstance(obj, dict):
-            return obj
-        # Keras Tokenizer pickled directly
-        if hasattr(obj, "word_index"):
-            return obj.word_index
-        raise ValueError(f"tokenizer.pkl has unexpected type: {type(obj)}")
+    for path in [pkl_path, tokenizer_pkl]:
+        if path.exists():
+            with open(path, "rb") as f:
+                obj = pickle.load(f)
+            return obj.word_index if hasattr(obj, "word_index") else obj
 
     if json_path.exists():
         try:
@@ -175,9 +172,21 @@ def _load_tokenizer(model_dir: Path) -> dict:
         return tok.word_index
 
     raise FileNotFoundError(
-        "No tokenizer found in model_dir. "
+        "No tokenizer /vocab found in model_dir. "
         "Expected tokenizer.pkl or tokenizer.json."
     )
+
+# ADDED FIX: Helper to load architecture from JSON
+def _load_lstm_arch(model_dir: Path) -> dict:
+    cfg_path = model_dir / "model_config.json"
+    with open(cfg_path, "r") as f:
+        config = json.load(f)
+    return {
+        "vocab_size": config["vocab_size"],
+        "embed_dim":  config["embed_dim"],
+        "hidden_dim": config["lstm_units"],
+        "num_layers": config.get("num_layers", 2)
+    }
 
 
 def _evaluate_lstm_pytorch(model_dir: Path, test_df: pd.DataFrame) -> dict:
