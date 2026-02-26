@@ -25,6 +25,8 @@ from pathlib import Path
 import boto3
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dep import (
@@ -42,6 +44,29 @@ S3_METRICS_PREFIX   = os.environ.get("S3_METRICS_PREFIX",   f"{PROJECT_NAME}/met
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+
+
+# --- UPDATED MODEL CLASS TO MATCH model_train.py ---
+class BiLSTMClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim, lstm_units, dense_units, dropout):
+        super(BiLSTMClassifier, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(embed_dim, lstm_units, batch_first=True, bidirectional=True)
+        self.dropout = nn.Dropout(dropout)
+        self.fc1 = nn.Linear(lstm_units * 2, dense_units)
+        self.fc2 = nn.Linear(dense_units, 1)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x = self.embedding(x)
+        _, (h_n, _) = self.lstm(x)
+        # Concatenate the final forward and backward hidden states
+        hidden = torch.cat((h_n[-2, :, :], h_n[-1, :, :]), dim=1)
+        x = self.fc1(hidden)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return torch.sigmoid(x).squeeze(1)
 
 
 def get_s3_client():
@@ -184,34 +209,20 @@ def _load_lstm_arch(model_dir: Path) -> dict:
     return {
         "vocab_size": config["vocab_size"],
         "embed_dim":  config["embed_dim"],
-        "hidden_dim": config["lstm_units"],
-        "num_layers": config.get("num_layers", 2)
+        "lstm_units": config["lstm_units"],
+        "dense_units": config["dense_units"],
+        "dropout":    config["dropout"]
     }
 
 
 def _evaluate_lstm_pytorch(model_dir: Path, test_df: pd.DataFrame) -> dict:
-    import torch
-    import torch.nn as nn
     from sklearn.metrics import classification_report, roc_auc_score
 
     arch = _load_lstm_arch(model_dir)
     log.info("Loaded LSTM arch: %s", arch)
 
-    class LSTMClassifier(nn.Module):
-        def __init__(self, vocab_size, embed_dim, hidden_dim, num_layers):
-            super().__init__()
-            self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-            self.lstm      = nn.LSTM(embed_dim, hidden_dim, num_layers,
-                                     batch_first=True, bidirectional=True)
-            self.fc        = nn.Linear(hidden_dim * 2, 1)
-
-        def forward(self, x):
-            emb = self.embedding(x)
-            _, (h, _) = self.lstm(emb)
-            h = torch.cat([h[-2], h[-1]], dim=1)
-            return torch.sigmoid(self.fc(h)).squeeze(1)
-
-    model = LSTMClassifier(**arch)
+    # Initialize model using updated class that matches training script
+    model = BiLSTMClassifier(**arch)
     model.load_state_dict(torch.load(model_dir / "lstm_model.pt", map_location="cpu"))
     model.eval()
 
