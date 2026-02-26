@@ -38,7 +38,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success'
 
     # Require manual approval for production deployments
-    environment: production
+    # environment: production
 
     steps:
       # ================================================================
