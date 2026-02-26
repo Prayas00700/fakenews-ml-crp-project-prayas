@@ -1,220 +1,454 @@
-name: "4. Model Evaluate"
+"""
+src/evaluation/model_evaluate.py
+─────────────────────────────────
+Downloads the trained model artifact from S3, runs a held-out evaluation,
+writes metrics to S3, and exits with code 1 if quality gates are not met
+(which will fail the GitHub Actions workflow and block deployment).
 
-on:
-  workflow_run:
-    workflows: ["3. Model Training (SageMaker)"]
-    types: [completed]
+Usage:
+    python src/evaluation/model_evaluate.py
 
-  workflow_dispatch:
-    inputs:
-      model_data:
-        description: 'S3 URI of the model artifact (model.tar.gz)'
-        required: true
-      model_type:
-        description: 'nb | lstm | bert'
-        required: true
-        default: 'lstm'
-        type: choice
-        options:
-          - nb
-          - lstm
-          - bert
+Env vars expected:
+    MODEL_DATA  — s3://bucket/prefix/model.tar.gz  (written by model_train.py)
+    MODEL_TYPE  — nb | lstm | bert
+"""
 
-env:
-  AWS_REGION:   ${{ vars.AWS_REGION }}
-  S3_BUCKET:    ${{ secrets.S3_BUCKET }}
-  PROJECT_NAME: ${{ vars.PROJECT_NAME }}
-  MODEL_DATA:   ""   # set at runtime via $GITHUB_ENV
-  MODEL_TYPE:   ""   # set at runtime via $GITHUB_ENV
+import os
+import sys
+import json
+import logging
+import pickle
+import tarfile
+import tempfile
+from pathlib import Path
 
-jobs:
-  evaluate:
-    name: "Evaluate Model & Check Quality Gates"
-    runs-on: ubuntu-latest
+import boto3
+import numpy as np
+import pandas as pd
 
-    permissions:
-      id-token: write
-      contents: read
-      actions:  read   # required for gh api cross-workflow artifact access
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from dep import (
+    AWS_REGION,
+    S3_BUCKET,
+    PROJECT_NAME,
+    MIN_ACCURACY,
+    MIN_F1_FAKE,
+    MODEL_TYPE,
+    MAX_LEN,
+)
 
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+S3_PROCESSED_PREFIX = os.environ.get("S3_PROCESSED_PREFIX", f"{PROJECT_NAME}/data/processed/")
+S3_METRICS_PREFIX   = os.environ.get("S3_METRICS_PREFIX",   f"{PROJECT_NAME}/metrics/")
 
-    outputs:
-      quality-gate-passed: ${{ steps.gate.outputs.passed }}
-      model-accuracy:      ${{ steps.gate.outputs.accuracy }}
-      model-f1-fake:       ${{ steps.gate.outputs.f1_fake }}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
 
-    steps:
-      # ================================================================
-      # Step 1: Checkout
-      # ================================================================
-      - name: Checkout repository
-        uses: actions/checkout@v4
 
-      # ================================================================
-      # Step 2: Resolve MODEL_DATA / MODEL_TYPE
-      # ================================================================
-      - name: Download model-data artifact (if chained via workflow_run)
-        if: github.event_name == 'workflow_run'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_ID:   ${{ github.event.workflow_run.id }}
-          REPO:     ${{ github.repository }}
-        run: |
-          # actions/download-artifact@v4 cannot fetch cross-workflow artifacts.
-          # Use the GitHub REST API directly instead.
-          echo "Fetching artifact list from run $RUN_ID..."
+def get_s3_client():
+    return boto3.client(
+        "s3",
+        region_name=AWS_REGION,
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
+    )
 
-          ARTIFACT_URL=$(gh api \
-            repos/$REPO/actions/runs/$RUN_ID/artifacts \
-            --jq '.artifacts[] | select(.name == "model-data") | .archive_download_url')
 
-          if [ -z "$ARTIFACT_URL" ]; then
-            echo "ERROR: 'model-data' artifact not found in run $RUN_ID"
-            echo "Make sure Workflow 3 completed successfully and uploaded the artifact."
-            exit 1
-          fi
+def parse_s3_uri(uri: str):
+    parts = uri.replace("s3://", "").split("/", 1)
+    return parts[0], parts[1]
 
-          echo "Downloading artifact..."
-          curl -sL \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "$ARTIFACT_URL" -o model-data.zip
 
-          unzip -o model-data.zip
-          echo "Artifact contents:"; ls -la model_data.env
+def download_and_extract_model(s3, model_data_uri: str, dest: Path) -> Path:
+    bucket, key = parse_s3_uri(model_data_uri)
+    tarball = dest / "model.tar.gz"
+    log.info("Downloading model artifact: %s", model_data_uri)
+    s3.download_file(Bucket=bucket, Key=key, Filename=str(tarball))
+    with tarfile.open(tarball, "r:gz") as tf:
+        tf.extractall(dest)
+    log.info("Extracted model to %s", dest)
+    return dest
 
-      - name: Load MODEL_DATA from artifact
-        if: github.event_name == 'workflow_run'
-        run: |
-          source model_data.env
-          echo "MODEL_DATA=$MODEL_DATA" >> $GITHUB_ENV
-          echo "MODEL_TYPE=$MODEL_TYPE" >> $GITHUB_ENV
 
-      - name: Load MODEL_DATA from manual inputs
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          echo "MODEL_DATA=${{ github.event.inputs.model_data }}" >> $GITHUB_ENV
-          echo "MODEL_TYPE=${{ github.event.inputs.model_type }}" >> $GITHUB_ENV
+def load_test_data(s3, tmp: Path) -> pd.DataFrame:
+    proc_path = tmp / "processed_dataset.parquet"
+    log.info("Downloading processed dataset for evaluation...")
+    s3.download_file(
+        Bucket=S3_BUCKET,
+        Key=f"{S3_PROCESSED_PREFIX}processed_dataset.parquet",
+        Filename=str(proc_path),
+    )
+    df = pd.read_parquet(proc_path)
+    from sklearn.model_selection import train_test_split
+    _, test_df = train_test_split(df, test_size=0.2, stratify=df["label_id"], random_state=42)
+    return test_df.reset_index(drop=True)
 
-      # ================================================================
-      # Step 3: Setup Python
-      # ================================================================
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
 
-      # ================================================================
-      # Step 4: Install dependencies
-      # ================================================================
-      - name: Install base dependencies
-        run: pip install boto3 pandas numpy pyarrow scikit-learn
+def evaluate_nb(model_dir: Path, test_df: pd.DataFrame) -> dict:
+    from sklearn.metrics import classification_report, roc_auc_score
 
-      - name: Install TensorFlow (lstm — covers TF/Keras artifacts)
-        if: env.MODEL_TYPE == 'lstm'
-        run: pip install tensorflow
+    with open(model_dir / "tfidf_vectorizer.pkl", "rb") as f:
+        tfidf = pickle.load(f)
+    with open(model_dir / "nb_model.pkl", "rb") as f:
+        nb = pickle.load(f)
 
-      - name: Install PyTorch (lstm — covers PyTorch artifacts)
-        if: env.MODEL_TYPE == 'lstm'
-        run: pip install torch
+    X = tfidf.transform(test_df["clean_tfidf"].values)
+    y = test_df["label_id"].values
+    y_pred = nb.predict(X)
+    y_prob = nb.predict_proba(X)[:, 1]
+    report = classification_report(y, y_pred, output_dict=True)
+    return {
+        "model_type":     "nb",
+        "accuracy":       report["accuracy"],
+        "auc":            float(roc_auc_score(y, y_prob)),
+        "f1_fake":        report["1"]["f1-score"],
+        "precision_fake": report["1"]["precision"],
+        "recall_fake":    report["1"]["recall"],
+    }
 
-      - name: Install PyTorch + Transformers (bert only)
-        if: env.MODEL_TYPE == 'bert'
-        run: pip install torch transformers
 
-      # ================================================================
-      # Step 5: Configure AWS credentials
-      # ================================================================
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region:     ${{ env.AWS_REGION }}
+def _detect_lstm_backend(model_dir: Path) -> str:
+    """
+    Inspect model_dir contents and return 'pytorch' or 'tensorflow'.
 
-      # ================================================================
-      # Step 6: Run evaluation (downloads model + test data from S3)
-      # ================================================================
-      - name: Run model evaluation
-        run: python src/evaluation/model_evaluate.py
+    PyTorch layout  : lstm_model.pt  (arch from lstm_model_arch.pkl OR model_config.json)
+    TF/Keras layout : lstm_model.h5 OR saved_model.pb
+    """
+    if (model_dir / "lstm_model.pt").exists():
+        log.info("Detected PyTorch LSTM artifact (lstm_model.pt present).")
+        return "pytorch"
 
-      # ================================================================
-      # Step 7: Read quality gate result (written by model_evaluate.py)
-      # ================================================================
-      - name: Read quality gate result
-        id: gate
-        run: |
-          source eval_metrics.env
-          echo "passed=$QUALITY_GATE_PASSED"  >> $GITHUB_OUTPUT
-          echo "accuracy=$MODEL_ACCURACY"      >> $GITHUB_OUTPUT
-          echo "f1_fake=$MODEL_F1_FAKE"        >> $GITHUB_OUTPUT
+    tf_indicators = ["lstm_model.h5", "saved_model.pb", "keras_metadata.pb"]
+    if any((model_dir / f).exists() for f in tf_indicators):
+        log.info("Detected TensorFlow/Keras LSTM artifact.")
+        return "tensorflow"
 
-      # ================================================================
-      # Step 8: Print evaluation summary
-      # ================================================================
-      - name: Print evaluation summary
-        run: |
-          echo ""
-          echo "=========================================="
-          echo " EVALUATION RESULTS"
-          echo "=========================================="
-          echo "  Model type : ${{ env.MODEL_TYPE }}"
-          echo "  Accuracy   : ${{ steps.gate.outputs.accuracy }}  (min: 0.80)"
-          echo "  F1 (fake)  : ${{ steps.gate.outputs.f1_fake }}  (min: 0.78)"
-          echo "  Gate passed: ${{ steps.gate.outputs.passed }}"
-          echo "=========================================="
+    # List contents to help diagnose unexpected layouts
+    contents = sorted(str(p.relative_to(model_dir)) for p in model_dir.rglob("*") if p.is_file())
+    raise FileNotFoundError(
+        "Cannot determine LSTM backend from model_dir contents.\n"
+        f"Files found:\n  " + "\n  ".join(contents) + "\n\n"
+        "Expected either:\n"
+        "  [PyTorch]     lstm_model.pt  (+ model_config.json or lstm_model_arch.pkl, + vocab.pkl or tokenizer.pkl)\n"
+        "  [TF/Keras]    lstm_model.h5 (or saved_model.pb)  + tokenizer.pkl / tokenizer.json"
+    )
 
-      # ================================================================
-      # Step 9: Hard fail if quality gates not met — blocks deployment
-      # ================================================================
-      - name: Fail if quality gate did not pass
-        if: steps.gate.outputs.passed == 'false'
-        run: |
-          echo "::error::Quality gates FAILED — deployment is blocked."
-          echo "  Accuracy required: 0.80   got: ${{ steps.gate.outputs.accuracy }}"
-          echo "  F1 (fake) required: 0.78  got: ${{ steps.gate.outputs.f1_fake }}"
-          exit 1
 
-      # ================================================================
-      # Step 10: Save artifacts for downstream deploy job
-      # ================================================================
-      - name: Save eval metrics artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name:            eval-metrics
-          path:            eval_metrics.env
-          retention-days:  7
+def _texts_to_padded(texts, word_index: dict, max_len: int) -> np.ndarray:
+    seqs   = [[word_index.get(w, 1) for w in t.split()] for t in texts]
+    padded = np.zeros((len(seqs), max_len), dtype=np.int64)
+    for i, s in enumerate(seqs):
+        length = min(len(s), max_len)
+        padded[i, :length] = s[:length]
+    return padded
 
-      - name: Write model data artifact (pass-through to deploy)
-        run: |
-          printf "MODEL_DATA=%s\nMODEL_TYPE=%s\n" \
-            "${{ env.MODEL_DATA }}" "${{ env.MODEL_TYPE }}" > model_data_for_deploy.env
 
-      - name: Upload model data artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name:            model-data-eval
-          path:            model_data_for_deploy.env
-          retention-days:  7
+def _load_tokenizer(model_dir: Path) -> dict:
+    """
+    Load word-index vocab/tokenizer.  Tries these files in order:
+      1. tokenizer.pkl  — pickle of a dict {word: int} or Keras Tokenizer object
+      2. vocab.pkl      — same formats (alternate name used by some trainers)
+      3. tokenizer.json — Keras JSON tokenizer
+    Returns a plain Python dict {word: int}.
+    """
+    def _from_pkl(path: Path) -> dict:
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        if isinstance(obj, dict):
+            return obj
+        if hasattr(obj, "word_index"):          # Keras Tokenizer pickled directly
+            return obj.word_index
+        raise ValueError(f"{path.name} has unexpected type: {type(obj)}")
 
-      # ================================================================
-      # Step 11: Create summary
-      # ================================================================
-      - name: Create summary
-        run: |
-          echo "## Model Evaluation Complete ✓" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Results:**" >> $GITHUB_STEP_SUMMARY
-          echo "- Model Type : \`${{ env.MODEL_TYPE }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Accuracy   : \`${{ steps.gate.outputs.accuracy }}\`  (threshold: 0.80)" >> $GITHUB_STEP_SUMMARY
-          echo "- F1 (fake)  : \`${{ steps.gate.outputs.f1_fake }}\`  (threshold: 0.78)" >> $GITHUB_STEP_SUMMARY
-          echo "- Gate passed: \`${{ steps.gate.outputs.passed }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.gate.outputs.passed }}" = "true" ]; then
-            echo "**Next Step:** Run '5. Model Deploy (SageMaker Endpoint)'" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "**Action Required:** Retrain the model before deploying." >> $GITHUB_STEP_SUMMARY
-          fi
-          
+    for pkl_name in ("tokenizer.pkl", "vocab.pkl"):
+        p = model_dir / pkl_name
+        if p.exists():
+            log.info("Loading vocab from %s", p.name)
+            return _from_pkl(p)
+
+    json_path = model_dir / "tokenizer.json"
+    if json_path.exists():
+        try:
+            from tensorflow.keras.preprocessing.text import tokenizer_from_json
+        except ImportError:
+            from keras.preprocessing.text import tokenizer_from_json
+        with open(json_path) as f:
+            tok = tokenizer_from_json(f.read())
+        return tok.word_index
+
+    raise FileNotFoundError(
+        "No vocab/tokenizer found in model_dir. "
+        "Expected one of: tokenizer.pkl, vocab.pkl, tokenizer.json"
+    )
+
+
+def _load_lstm_arch(model_dir: Path) -> dict:
+    """
+    Load LSTM architecture hyperparameters.  Tries:
+      1. lstm_model_arch.pkl  — pickle dict (original trainer)
+      2. model_config.json    — JSON dict   (alternate trainer)
+    Expected keys: vocab_size, embed_dim, hidden_dim, num_layers
+    """
+    pkl_path  = model_dir / "lstm_model_arch.pkl"
+    json_path = model_dir / "model_config.json"
+
+    if pkl_path.exists():
+        with open(pkl_path, "rb") as f:
+            return pickle.load(f)
+
+    if json_path.exists():
+        with open(json_path) as f:
+            cfg = json.load(f)
+        # model_config.json may store the keys directly or nested under a key
+        arch_keys = {"vocab_size", "embed_dim", "hidden_dim", "num_layers"}
+        if arch_keys.issubset(cfg.keys()):
+            return {k: cfg[k] for k in arch_keys}
+        # Some trainers nest under 'model' or 'architecture'
+        for sub in ("model", "architecture", "hyperparameters", "params"):
+            if sub in cfg and arch_keys.issubset(cfg[sub].keys()):
+                return {k: cfg[sub][k] for k in arch_keys}
+        # Log the full config so the user can see what keys are available
+        log.warning("model_config.json found but expected keys not present. Contents: %s", cfg)
+        raise KeyError(
+            f"model_config.json does not contain the required keys {arch_keys}. "
+            f"Found keys: {set(cfg.keys())}"
+        )
+
+    raise FileNotFoundError(
+        "No model architecture config found. "
+        "Expected lstm_model_arch.pkl or model_config.json with keys: "
+        "vocab_size, embed_dim, hidden_dim, num_layers"
+    )
+
+
+def _evaluate_lstm_pytorch(model_dir: Path, test_df: pd.DataFrame) -> dict:
+    import torch
+    import torch.nn as nn
+    from sklearn.metrics import classification_report, roc_auc_score
+
+    arch = _load_lstm_arch(model_dir)
+    log.info("Loaded LSTM arch: %s", arch)
+
+    class LSTMClassifier(nn.Module):
+        def __init__(self, vocab_size, embed_dim, hidden_dim, num_layers):
+            super().__init__()
+            self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+            self.lstm      = nn.LSTM(embed_dim, hidden_dim, num_layers,
+                                     batch_first=True, bidirectional=True)
+            self.fc        = nn.Linear(hidden_dim * 2, 1)
+
+        def forward(self, x):
+            emb = self.embedding(x)
+            _, (h, _) = self.lstm(emb)
+            h = torch.cat([h[-2], h[-1]], dim=1)
+            return torch.sigmoid(self.fc(h)).squeeze(1)
+
+    model = LSTMClassifier(**arch)
+    model.load_state_dict(torch.load(model_dir / "lstm_model.pt", map_location="cpu"))
+    model.eval()
+
+    word_index = _load_tokenizer(model_dir)
+    X = _texts_to_padded(test_df["clean_lstm"].values, word_index, MAX_LEN)
+    y = test_df["label_id"].values
+
+    all_probs  = []
+    batch_size = 64
+    with torch.no_grad():
+        for start in range(0, len(X), batch_size):
+            batch = torch.tensor(X[start:start + batch_size])
+            probs = model(batch).cpu().numpy()
+            all_probs.extend(probs)
+
+    y_prob = np.array(all_probs)
+    y_pred = (y_prob >= 0.5).astype(int)
+    report = classification_report(y, y_pred, output_dict=True)
+    return {
+        "model_type":     "lstm",
+        "accuracy":       report["accuracy"],
+        "auc":            float(roc_auc_score(y, y_prob)),
+        "f1_fake":        report["1"]["f1-score"],
+        "precision_fake": report["1"]["precision"],
+        "recall_fake":    report["1"]["recall"],
+    }
+
+
+def _evaluate_lstm_tensorflow(model_dir: Path, test_df: pd.DataFrame) -> dict:
+    """
+    Evaluate a TF/Keras LSTM model.
+    Supports:
+      - lstm_model.h5          (single-file SavedModel / legacy HDF5)
+      - <model_dir>/           (TF SavedModel directory with saved_model.pb)
+    """
+    from sklearn.metrics import classification_report, roc_auc_score
+
+    try:
+        import tensorflow as tf
+    except ImportError as exc:
+        raise ImportError(
+            "TensorFlow is required to evaluate this model artifact but is not installed.\n"
+            "Add `pip install tensorflow` to the 'Install dependencies' step in your workflow, "
+            "or re-train the model with the PyTorch trainer."
+        ) from exc
+
+    # Locate the model file / directory
+    h5_path = model_dir / "lstm_model.h5"
+    if h5_path.exists():
+        log.info("Loading Keras model from %s", h5_path)
+        model = tf.keras.models.load_model(str(h5_path))
+    elif (model_dir / "saved_model.pb").exists():
+        log.info("Loading TF SavedModel from %s", model_dir)
+        model = tf.keras.models.load_model(str(model_dir))
+    else:
+        raise FileNotFoundError("TF model file not found (expected lstm_model.h5 or saved_model.pb).")
+
+    word_index = _load_tokenizer(model_dir)
+    X = _texts_to_padded(test_df["clean_lstm"].values, word_index, MAX_LEN)
+    y = test_df["label_id"].values
+
+    log.info("Running TF inference on %d samples...", len(X))
+    y_prob = model.predict(X, batch_size=64, verbose=0).flatten()
+    y_pred = (y_prob >= 0.5).astype(int)
+    report = classification_report(y, y_pred, output_dict=True)
+    return {
+        "model_type":     "lstm",
+        "accuracy":       report["accuracy"],
+        "auc":            float(roc_auc_score(y, y_prob)),
+        "f1_fake":        report["1"]["f1-score"],
+        "precision_fake": report["1"]["precision"],
+        "recall_fake":    report["1"]["recall"],
+    }
+
+
+def evaluate_lstm(model_dir: Path, test_df: pd.DataFrame) -> dict:
+    """
+    Auto-detect whether the LSTM artifact was produced by PyTorch or TF/Keras
+    and dispatch to the appropriate evaluator.
+
+    PyTorch layout  : lstm_model.pt  + lstm_model_arch.pkl + tokenizer.pkl
+    TF/Keras layout : lstm_model.h5 (or saved_model.pb)   + tokenizer.pkl / tokenizer.json
+    """
+    backend = _detect_lstm_backend(model_dir)
+    if backend == "pytorch":
+        return _evaluate_lstm_pytorch(model_dir, test_df)
+    return _evaluate_lstm_tensorflow(model_dir, test_df)
+
+
+def evaluate_bert(model_dir: Path, test_df: pd.DataFrame) -> dict:
+    import torch
+    from transformers import BertTokenizer, BertForSequenceClassification
+    from torch.utils.data import DataLoader, Dataset
+    from sklearn.metrics import classification_report, roc_auc_score
+
+    class SimpleDataset(Dataset):
+        def __init__(self, texts, labels, tok, max_len):
+            self.texts = texts; self.labels = labels
+            self.tok   = tok;   self.max_len = max_len
+
+        def __len__(self):
+            return len(self.texts)
+
+        def __getitem__(self, idx):
+            enc = self.tok(
+                self.texts.iloc[idx], truncation=True,
+                padding="max_length", max_length=self.max_len,
+                return_tensors="pt"
+            )
+            return {
+                "input_ids":      enc["input_ids"].squeeze(0),
+                "attention_mask": enc["attention_mask"].squeeze(0),
+                "labels":         torch.tensor(self.labels.iloc[idx], dtype=torch.long),
+            }
+
+    tokenizer = BertTokenizer.from_pretrained(str(model_dir / "bert_tokenizer"))
+    model     = BertForSequenceClassification.from_pretrained(str(model_dir / "bert_model"))
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device).eval()
+
+    dl = DataLoader(
+        SimpleDataset(test_df["clean_text_raw"], test_df["label_id"], tokenizer, 256),
+        batch_size=16
+    )
+    preds = []; probs = []; true = []
+    with torch.no_grad():
+        for b in dl:
+            out = model(
+                input_ids=b["input_ids"].to(device),
+                attention_mask=b["attention_mask"].to(device)
+            )
+            p = torch.softmax(out.logits, dim=1)[:, 1].cpu().numpy()
+            probs.extend(p)
+            preds.extend((p >= 0.5).astype(int))
+            true.extend(b["labels"].cpu().numpy())
+
+    report = classification_report(true, preds, output_dict=True)
+    return {
+        "model_type":     "bert",
+        "accuracy":       report["accuracy"],
+        "auc":            float(roc_auc_score(true, probs)),
+        "f1_fake":        report["1"]["f1-score"],
+        "precision_fake": report["1"]["precision"],
+        "recall_fake":    report["1"]["recall"],
+    }
+
+
+def main() -> None:
+    model_data = os.environ.get("MODEL_DATA", "")
+    model_type = os.environ.get("MODEL_TYPE", MODEL_TYPE).lower()
+
+    if not model_data:
+        log.error("MODEL_DATA env var is not set. Cannot evaluate.")
+        sys.exit(1)
+
+    s3 = get_s3_client()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp       = Path(tmpdir)
+        model_dir = tmp / "model"
+        model_dir.mkdir()
+
+        download_and_extract_model(s3, model_data, model_dir)
+        test_df = load_test_data(s3, tmp)
+
+        evaluators = {"nb": evaluate_nb, "lstm": evaluate_lstm, "bert": evaluate_bert}
+        if model_type not in evaluators:
+            log.error("Unknown MODEL_TYPE: %s", model_type)
+            sys.exit(1)
+
+        metrics = evaluators[model_type](model_dir, test_df)
+        log.info("Evaluation metrics: %s", json.dumps(metrics, indent=2))
+
+        passed = True
+        if metrics["accuracy"] < MIN_ACCURACY:
+            log.error("GATE FAILED: accuracy=%.4f < threshold=%.4f", metrics["accuracy"], MIN_ACCURACY)
+            passed = False
+        if metrics["f1_fake"] < MIN_F1_FAKE:
+            log.error("GATE FAILED: f1_fake=%.4f < threshold=%.4f", metrics["f1_fake"], MIN_F1_FAKE)
+            passed = False
+
+        metrics["quality_gate_passed"] = passed
+
+        metrics_path = tmp / "eval_metrics.json"
+        metrics_path.write_text(json.dumps(metrics, indent=2))
+        s3.upload_file(
+            Filename=str(metrics_path),
+            Bucket=S3_BUCKET,
+            Key=f"{S3_METRICS_PREFIX}eval_metrics.json",
+        )
+        log.info("Metrics uploaded to s3://%s/%seval_metrics.json", S3_BUCKET, S3_METRICS_PREFIX)
+
+        Path("eval_metrics.env").write_text(
+            f"QUALITY_GATE_PASSED={str(passed).lower()}\n"
+            f"MODEL_ACCURACY={metrics['accuracy']:.4f}\n"
+            f"MODEL_F1_FAKE={metrics['f1_fake']:.4f}\n"
+        )
+
+    if not passed:
+        log.error("Quality gate(s) failed — aborting pipeline.")
+        sys.exit(1)
+
+    log.info("All quality gates passed. Proceeding to deployment.")
+
+
+if __name__ == "__main__":
+    main()
+    
