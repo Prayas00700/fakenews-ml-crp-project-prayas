@@ -115,7 +115,7 @@ def _detect_lstm_backend(model_dir: Path) -> str:
     TF/Keras layout : lstm_model.h5 OR saved_model.pb     + tokenizer.pkl
                       (tokenizer may also be tokenizer.json for keras)
     """
-    if (model_dir / "lstm_model.pt").exists() and (model_dir / "lstm_model_arch.pkl").exists():
+    if (model_dir / "lstm_model.pt").exists():
         log.info("Detected PyTorch LSTM artifact.")
         return "pytorch"
 
