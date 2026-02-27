@@ -15,6 +15,9 @@ import textwrap
 import tempfile
 from pathlib import Path
 
+# Add project root to path BEFORE importing local modules
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import boto3
 import sagemaker
 from sagemaker.sklearn.model import SKLearnModel
@@ -23,6 +26,8 @@ from sagemaker.huggingface import HuggingFaceModel
 # --- FIX: Added PyTorchModel to support your .pt artifact ---
 from sagemaker.pytorch.model import PyTorchModel
 from botocore.exceptions import ClientError
+
+# Import your constants from dep.py
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dep import (
