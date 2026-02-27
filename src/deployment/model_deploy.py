@@ -112,7 +112,7 @@ def create_sagemaker_model(model_name, model_data_url, sagemaker_role, aws_regio
     # Use the official Hugging Face Inference DLC URI for BERT/Transformers
     # Account 763104351884 is the AWS Deep Learning Container account
     # Change from -cpu- to -gpu- and ensure CUDA version is included
-    image_uri = f"763104351884.dkr.ecr.{aws_region}.amazonaws.com/huggingface-pytorch-inference:2.1.0-transformers4.37.0-gpu-py310-cu118-ubuntu22.04"
+    image_uri = f"763104351884.dkr.ecr.{aws_region}.amazonaws.com/huggingface-pytorch-inference:2.1.0-transformers4.37.0-gpu-py310-ubuntu22.04"
     
     sm.create_model(
         ModelName=model_name,
