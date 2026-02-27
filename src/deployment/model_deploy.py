@@ -4,7 +4,15 @@ src/deployment/model_deploy.py
 Creates (or updates) a SageMaker real-time inference endpoint for the
 trained fake-news detection model.
 
-Supports NB (SKLearn), LSTM (PyTorch), and BERT (HuggingFace) model types.
+Supports BERT (HuggingFace) model type.
+
+Usage:
+    python src/deployment/model_deploy.py
+
+Env vars:
+    MODEL_DATA              — s3://… artifact path
+    MODEL_TYPE              — bert
+    SAGEMAKER_ENDPOINT_NAME — name of the endpoint to create/update
 """
 
 import os
@@ -15,19 +23,10 @@ import textwrap
 import tempfile
 from pathlib import Path
 
-# Add project root to path BEFORE importing local modules
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 import boto3
 import sagemaker
-from sagemaker.sklearn.model import SKLearnModel
-from sagemaker.tensorflow.model import TensorFlowModel
 from sagemaker.huggingface import HuggingFaceModel
-# --- FIX: Added PyTorchModel to support your .pt artifact ---
-from sagemaker.pytorch.model import PyTorchModel
 from botocore.exceptions import ClientError
-
-# Import your constants from dep.py
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dep import (
@@ -45,55 +44,93 @@ S3_ARTIFACTS_PREFIX = os.environ.get("S3_ARTIFACTS_PREFIX", f"{PROJECT_NAME}/art
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inline inference handlers (one per model type)
+# These are uploaded as part of the SageMaker model package.
+# ─────────────────────────────────────────────────────────────────────────────
+
+BERT_INFERENCE_SCRIPT = textwrap.dedent("""
+import os, json
+import torch
+from transformers import BertTokenizer, BertForSequenceClassification
+
+def model_fn(model_dir):
+    tok   = BertTokenizer.from_pretrained(os.path.join(model_dir,"bert_tokenizer"))
+    model = BertForSequenceClassification.from_pretrained(os.path.join(model_dir,"bert_model"))
+    model.eval()
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    return {"model": model, "tokenizer": tok, "device": device}
+
+def input_fn(request_body, content_type):
+    return json.loads(request_body).get("text","")
+
+def predict_fn(text, bundle):
+    enc=bundle["tokenizer"](text,return_tensors="pt",truncation=True,padding=True,max_length=256)
+    enc={k:v.to(bundle["device"]) for k,v in enc.items()}
+    with torch.no_grad():
+        out=bundle["model"](**enc)
+        probs=torch.softmax(out.logits,dim=1)[0].cpu().tolist()
+    fake_prob=probs[1]
+    return {"label":"fake" if fake_prob>=0.5 else "real","fake_prob":fake_prob,"real_prob":probs[0]}
+
+def output_fn(prediction, accept):
+    return json.dumps(prediction), "application/json"
+""")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deployment helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 def get_sagemaker_session():
-    boto_session = boto3.Session(region_name=AWS_REGION)
-    return sagemaker.Session(boto_session=boto_session)
+    return sagemaker.Session(boto_session=boto3.Session(region_name=AWS_REGION))
+
+
+def endpoint_exists(sm_client, endpoint_name: str) -> bool:
+    try:
+        sm_client.describe_endpoint(EndpointName=endpoint_name)
+        return True
+    except ClientError:
+        return False
+
 
 def deploy_model(model_data: str, model_type: str, session: sagemaker.Session) -> str:
-    log.info("Deploying %s model from %s", model_type, model_data)
+    sm_client  = boto3.client("sagemaker", region_name=AWS_REGION)
+    exists     = endpoint_exists(sm_client, ENDPOINT_NAME)
+    action_str = "Updating" if exists else "Creating"
+    log.info("%s endpoint: %s", action_str, ENDPOINT_NAME)
 
-    if model_type == "nb":
-        model = SKLearnModel(
-            model_data=model_data,
-            role=SAGEMAKER_ROLE_ARN,
-            entry_point="src/deployment/inference_nb.py",
-            framework_version="1.2-1",
-            sagemaker_session=session,
-        )
-    elif model_type == "lstm":
-        # --- FIX: Use PyTorchModel for .pt files ---
-        model = PyTorchModel(
-            model_data=model_data,
-            role=SAGEMAKER_ROLE_ARN,
-            entry_point="src/deployment/inference_lstm.py",
-            framework_version="2.0.1",
-            py_version="py310",
-            sagemaker_session=session,
-        )
-    elif model_type == "bert":
-        model = HuggingFaceModel(
-            model_data=model_data,
-            role=SAGEMAKER_ROLE_ARN,
-            transformers_version="4.26",
-            pytorch_version="1.13",
-            py_version="py39",
-            sagemaker_session=session,
-        )
-    else:
-        log.error("Unknown MODEL_TYPE: %s", model_type)
-        sys.exit(1)
+    SCRIPTS = {"bert": BERT_INFERENCE_SCRIPT}
 
-    log.info("Creating/Updating endpoint: %s", ENDPOINT_NAME)
-    predictor = model.deploy(
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as tmp:
+        tmp.write(SCRIPTS[model_type])
+        script_path = tmp.name
+
+    kwargs = dict(
+        model_data=model_data,
+        role=SAGEMAKER_ROLE_ARN,
+        entry_point=script_path,
+        sagemaker_session=session,
+    )
+
+    sm_model = HuggingFaceModel(transformers_version="4.26", pytorch_version="1.13", py_version="py39", **kwargs)
+
+    predictor = sm_model.deploy(
         initial_instance_count=1,
         instance_type=ENDPOINT_INSTANCE,
         endpoint_name=ENDPOINT_NAME,
-        update_endpoint=True,
+        update_endpoint=exists,
+        wait=True,
     )
-    log.info("Model deployed successfully to endpoint: %s", ENDPOINT_NAME)
+
+    log.info("Endpoint live: %s", ENDPOINT_NAME)
     return predictor.endpoint_name
 
+
 def smoke_test(endpoint_name: str) -> None:
+    """Send a quick prediction to verify the endpoint is healthy."""
     runtime = boto3.client("sagemaker-runtime", region_name=AWS_REGION)
     test_payload = json.dumps({"text": "Breaking: Scientists confirm miraculous cure with zero side effects found!"})
     response = runtime.invoke_endpoint(
@@ -105,6 +142,11 @@ def smoke_test(endpoint_name: str) -> None:
     log.info("Smoke test result: %s", result)
     assert "label" in result, "Smoke test failed — response missing 'label' key"
     log.info("Smoke test passed ✓")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     model_data = os.environ.get("MODEL_DATA", "")
@@ -118,10 +160,12 @@ def main() -> None:
     endpoint_name = deploy_model(model_data, model_type, session)
     smoke_test(endpoint_name)
 
+    # Write endpoint name for monitoring job
     Path("deployment.env").write_text(
         f"ENDPOINT_NAME={endpoint_name}\nMODEL_TYPE={model_type}\n"
     )
-    log.info("Wrote deployment.env")
+    log.info("Deployment complete.")
+
 
 if __name__ == "__main__":
     main()

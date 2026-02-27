@@ -11,13 +11,11 @@ on:
         description: 'S3 URI of the model artifact (model.tar.gz)'
         required: true
       model_type:
-        description: 'nb | lstm | bert'
+        description: 'bert'
         required: true
-        default: 'lstm'
+        default: 'bert'
         type: choice
         options:
-          - nb
-          - lstm
           - bert
 
 env:
@@ -33,15 +31,12 @@ jobs:
     name: "Deploy Model to SageMaker Endpoint"
     runs-on: ubuntu-latest
 
-    permissions:
-      id-token: write  # Required for OIDC/STS to prevent credential errors
-      contents: read   # Required for checkout
-      
     if: >
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
 
-    # environment: production
+    # Require manual approval for production deployments
+    environment: production
 
     steps:
       # ================================================================
@@ -51,56 +46,45 @@ jobs:
         uses: actions/checkout@v4
 
       # ================================================================
-      # Step 2: Download model-data artifact (if chained)
+      # Step 2: Resolve MODEL_DATA / MODEL_TYPE
       # ================================================================
-      - name: Download model-data artifact
+      - name: Download model-data artifact (if chained via workflow_run)
         if: github.event_name == 'workflow_run'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_ID:   ${{ github.event.workflow_run.id }}
-          REPO:     ${{ github.repository }}
-        run: |
-          ARTIFACT_URL=$(gh api \
-            repos/$REPO/actions/runs/$RUN_ID/artifacts \
-            --jq '.artifacts[] | select(.name == "model-data-eval") | .archive_download_url')
-          curl -sL -H "Authorization: Bearer $GH_TOKEN" "$ARTIFACT_URL" -o model-data.zip
-          unzip -o model-data.zip
+        uses: actions/download-artifact@v4
+        with:
+          name:         model-data-eval
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id:       ${{ github.event.workflow_run.id }}
 
-      # ================================================================
-      # Step 3: Set MODEL_DATA and MODEL_TYPE env
-      # ================================================================
-      - name: Load env vars
+      - name: Load MODEL_DATA from artifact
+        if: github.event_name == 'workflow_run'
         run: |
-          if [ "${{ github.event_name }}" == "workflow_run" ]; then
-            source model_data_for_deploy.env
-          else
-            MODEL_DATA=${{ github.event.inputs.model_data }}
-            MODEL_TYPE=${{ github.event.inputs.model_type }}
-          fi
+          source model_data_for_deploy.env
           echo "MODEL_DATA=$MODEL_DATA" >> $GITHUB_ENV
           echo "MODEL_TYPE=$MODEL_TYPE" >> $GITHUB_ENV
 
+      - name: Load MODEL_DATA from manual inputs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "MODEL_DATA=${{ github.event.inputs.model_data }}" >> $GITHUB_ENV
+          echo "MODEL_TYPE=${{ github.event.inputs.model_type }}" >> $GITHUB_ENV
+
       # ================================================================
-      # Step 4: Setup Python
+      # Step 3: Setup Python
       # ================================================================
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
-          cache: 'pip' # Speeds up subsequent runs
+          python-version: '3.9'
 
       # ================================================================
-      # Step 5: Install dependencies
+      # Step 4: Install dependencies
       # ================================================================
       - name: Install dependencies
-        run: |
-          # Ensure sagemaker and dependencies are installed in the 3.10 env
-          python3 -m pip install --upgrade pip
-          python3 -m pip install boto3 sagemaker pandas torch
-          if [ "$MODEL_TYPE" == "bert" ]; then python3 -m pip install transformers; fi
+        run: pip install boto3 sagemaker
 
       # ================================================================
-      # Step 6: Configure AWS credentials
+      # Step 5: Configure AWS credentials
       # ================================================================
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
@@ -109,28 +93,32 @@ jobs:
           aws-region:     ${{ env.AWS_REGION }}
 
       # ================================================================
-      # Step 7: Run model deployment script
+      # Step 6: Deploy model to SageMaker endpoint
       # ================================================================
-      - name: Run model deployment
-        id: deploy_info
-        run: |
-          # Use python3 to ensure library parity with Step 5
-          python3 src/deployment/model_deploy.py
-          
-          # Load the output environment file generated by the script
-          source deployment.env
-          echo "endpoint_name=$ENDPOINT_NAME" >> $GITHUB_OUTPUT
-          echo "model_type=$MODEL_TYPE"       >> $GITHUB_OUTPUT
+      - name: Deploy model to SageMaker endpoint
+        run: python src/deployment/model_deploy.py
 
       # ================================================================
-      # Step 8: Log success
+      # Step 7: Read deployed endpoint name
       # ================================================================
-      - name: Deployment status
+      - name: Read deployment info
+        id: deploy_info
         run: |
+          source deployment.env
+          echo "endpoint_name=$ENDPOINT_NAME" >> $GITHUB_OUTPUT
+          echo "model_type=$MODEL_TYPE"        >> $GITHUB_OUTPUT
+
+      # ================================================================
+      # Step 8: Print deployment summary
+      # ================================================================
+      - name: Print deployment summary
+        run: |
+          echo ""
           echo "=========================================="
-          echo "  Model successfully deployed!"
+          echo " DEPLOYMENT COMPLETE"
+          echo "=========================================="
           echo "  Endpoint  : ${{ steps.deploy_info.outputs.endpoint_name }}"
-          echo "  Type      : ${{ steps.deploy_info.outputs.model_type }}"
+          echo "  Model type: ${{ steps.deploy_info.outputs.model_type }}"
           echo "  Region    : ${{ env.AWS_REGION }}"
           echo "=========================================="
 
