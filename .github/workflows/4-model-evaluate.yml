@@ -11,13 +11,12 @@ on:
         description: 'S3 URI of the model artifact (model.tar.gz)'
         required: true
       model_type:
-        description: 'nb | lstm | bert'
+        description: 'nb | bert'
         required: true
-        default: 'lstm'
+        default: 'bert'
         type: choice
         options:
           - nb
-          - lstm
           - bert
 
 env:
@@ -113,14 +112,6 @@ jobs:
       - name: Install base dependencies
         run: pip install boto3 pandas numpy pyarrow scikit-learn
 
-      - name: Install TensorFlow (lstm — covers TF/Keras artifacts)
-        if: env.MODEL_TYPE == 'lstm'
-        run: pip install tensorflow
-
-      - name: Install PyTorch (lstm — covers PyTorch artifacts)
-        if: env.MODEL_TYPE == 'lstm'
-        run: pip install torch
-
       - name: Install PyTorch + Transformers (bert only)
         if: env.MODEL_TYPE == 'bert'
         run: pip install torch transformers
@@ -133,50 +124,6 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region:     ${{ env.AWS_REGION }}
-
-      # ================================================================
-      # Step 6a: Inspect model artifact contents (debug)
-      # ================================================================
-      - name: Inspect model artifact (debug)
-        if: env.MODEL_TYPE == 'lstm'
-        run: |
-          python3 - << 'PYEOF'
-          import boto3, tarfile, tempfile, json, pickle, os
-          from pathlib import Path
-
-          s3     = boto3.client("s3", region_name=os.environ["AWS_REGION"])
-          uri    = os.environ["MODEL_DATA"].replace("s3://", "")
-          bucket, key = uri.split("/", 1)
-
-          with tempfile.TemporaryDirectory() as tmp:
-              tmp = Path(tmp)
-              s3.download_file(bucket, key, str(tmp / "model.tar.gz"))
-              with tarfile.open(tmp / "model.tar.gz") as tf:
-                  tf.extractall(tmp)
-
-              print("=== Files in artifact ===")
-              for p in sorted(tmp.rglob("*")):
-                  if p.is_file():
-                      print(" ", p.relative_to(tmp))
-
-              cfg_path = tmp / "model_config.json"
-              if cfg_path.exists():
-                  print("\n=== model_config.json ===")
-                  print(cfg_path.read_text())
-
-              vocab_path = tmp / "vocab.pkl"
-              if vocab_path.exists():
-                  with open(vocab_path, "rb") as f:
-                      vocab = pickle.load(f)
-                  print("\n=== vocab.pkl ===")
-                  print("type:", type(vocab))
-                  if isinstance(vocab, dict):
-                      print("size:", len(vocab))
-                      print("sample:", list(vocab.items())[:3])
-                  elif hasattr(vocab, "word_index"):
-                      print("size:", len(vocab.word_index))
-                      print("sample:", list(vocab.word_index.items())[:3])
-          PYEOF
 
       # ================================================================
       # Step 6: Run evaluation (downloads model + test data from S3)

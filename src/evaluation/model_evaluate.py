@@ -10,14 +10,13 @@ Usage:
 
 Env vars expected:
     MODEL_DATA  — s3://bucket/prefix/model.tar.gz  (written by model_train.py)
-    MODEL_TYPE  — nb | lstm | bert
+    MODEL_TYPE  — bert
 """
 
 import os
 import sys
 import json
 import logging
-import pickle
 import tarfile
 import tempfile
 from pathlib import Path
@@ -25,8 +24,6 @@ from pathlib import Path
 import boto3
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dep import (
@@ -36,7 +33,6 @@ from dep import (
     MIN_ACCURACY,
     MIN_F1_FAKE,
     MODEL_TYPE,
-    MAX_LEN,
 )
 
 S3_PROCESSED_PREFIX = os.environ.get("S3_PROCESSED_PREFIX", f"{PROJECT_NAME}/data/processed/")
@@ -44,29 +40,6 @@ S3_METRICS_PREFIX   = os.environ.get("S3_METRICS_PREFIX",   f"{PROJECT_NAME}/met
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
-
-
-# --- UPDATED MODEL CLASS TO MATCH model_train.py ---
-class BiLSTMClassifier(nn.Module):
-    def __init__(self, vocab_size, embed_dim, lstm_units, dense_units, dropout):
-        super(BiLSTMClassifier, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.lstm = nn.LSTM(embed_dim, lstm_units, batch_first=True, bidirectional=True)
-        self.dropout = nn.Dropout(dropout)
-        self.fc1 = nn.Linear(lstm_units * 2, dense_units)
-        self.fc2 = nn.Linear(dense_units, 1)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        x = self.embedding(x)
-        _, (h_n, _) = self.lstm(x)
-        # Concatenate the final forward and backward hidden states
-        hidden = torch.cat((h_n[-2, :, :], h_n[-1, :, :]), dim=1)
-        x = self.fc1(hidden)
-        x = self.relu(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return torch.sigmoid(x).squeeze(1)
 
 
 def get_s3_client():
@@ -107,209 +80,6 @@ def load_test_data(s3, tmp: Path) -> pd.DataFrame:
     from sklearn.model_selection import train_test_split
     _, test_df = train_test_split(df, test_size=0.2, stratify=df["label_id"], random_state=42)
     return test_df.reset_index(drop=True)
-
-
-def evaluate_nb(model_dir: Path, test_df: pd.DataFrame) -> dict:
-    from sklearn.metrics import classification_report, roc_auc_score
-
-    with open(model_dir / "tfidf_vectorizer.pkl", "rb") as f:
-        tfidf = pickle.load(f)
-    with open(model_dir / "nb_model.pkl", "rb") as f:
-        nb = pickle.load(f)
-
-    X = tfidf.transform(test_df["clean_tfidf"].values)
-    y = test_df["label_id"].values
-    y_pred = nb.predict(X)
-    y_prob = nb.predict_proba(X)[:, 1]
-    report = classification_report(y, y_pred, output_dict=True)
-    return {
-        "model_type":     "nb",
-        "accuracy":       report["accuracy"],
-        "auc":            float(roc_auc_score(y, y_prob)),
-        "f1_fake":        report["1"]["f1-score"],
-        "precision_fake": report["1"]["precision"],
-        "recall_fake":    report["1"]["recall"],
-    }
-
-
-def _detect_lstm_backend(model_dir: Path) -> str:
-    """
-    Inspect model_dir contents and return 'pytorch' or 'tensorflow'.
-
-    PyTorch layout  : lstm_model.pt  + lstm_model_arch.pkl + tokenizer.pkl
-    TF/Keras layout : lstm_model.h5 OR saved_model.pb     + tokenizer.pkl
-                      (tokenizer may also be tokenizer.json for keras)
-    """
-    if (model_dir / "lstm_model.pt").exists():
-        log.info("Detected PyTorch LSTM artifact.")
-        return "pytorch"
-
-    tf_indicators = ["lstm_model.h5", "saved_model.pb", "keras_metadata.pb"]
-    if any((model_dir / f).exists() for f in tf_indicators):
-        log.info("Detected TensorFlow/Keras LSTM artifact.")
-        return "tensorflow"
-
-    # Last-resort: list what is actually there so the user can diagnose easily
-    contents = sorted(str(p.relative_to(model_dir)) for p in model_dir.rglob("*") if p.is_file())
-    raise FileNotFoundError(
-        "Cannot determine LSTM backend from model_dir contents.\n"
-        f"Files found:\n  " + "\n  ".join(contents) + "\n\n"
-        "Expected either:\n"
-        "  [PyTorch]     lstm_model.pt + lstm_model_arch.pkl + tokenizer.pkl\n"
-        "  [TF/Keras]    lstm_model.h5 (or saved_model.pb)  + tokenizer.pkl"
-    )
-
-
-def _texts_to_padded(texts, word_index: dict, max_len: int) -> np.ndarray:
-    seqs   = [[word_index.get(w, 1) for w in str(t).split()] for t in texts]
-    padded = np.zeros((len(seqs), max_len), dtype=np.int64)
-    for i, s in enumerate(seqs):
-        length = min(len(s), max_len)
-        padded[i, :length] = s[:length]
-    return padded
-
-
-def _load_tokenizer(model_dir: Path) -> dict:
-    """
-    Load word-index tokenizer saved as either:
-      - tokenizer.pkl   (pickle dict  {word: int})
-      - tokenizer.json  (Keras JSON — requires tensorflow/keras to parse)
-    Returns a plain Python dict {word: int}.
-    """
-    # UPDATED: Matches vocab.pkl from your log
-    pkl_path  = model_dir / "vocab.pkl"
-    tokenizer_pkl = model_dir / "tokenizer.pkl"
-    json_path = model_dir / "tokenizer.json"
-
-    for path in [pkl_path, tokenizer_pkl]:
-        if path.exists():
-            with open(path, "rb") as f:
-                obj = pickle.load(f)
-            return obj.word_index if hasattr(obj, "word_index") else obj
-
-    if json_path.exists():
-        try:
-            from tensorflow.keras.preprocessing.text import tokenizer_from_json
-        except ImportError:
-            from keras.preprocessing.text import tokenizer_from_json
-        with open(json_path) as f:
-            tok = tokenizer_from_json(f.read())
-        return tok.word_index
-
-    raise FileNotFoundError(
-        "No tokenizer /vocab found in model_dir. "
-        "Expected tokenizer.pkl or tokenizer.json."
-    )
-
-# ADDED FIX: Helper to load architecture from JSON
-def _load_lstm_arch(model_dir: Path) -> dict:
-    cfg_path = model_dir / "model_config.json"
-    with open(cfg_path, "r") as f:
-        config = json.load(f)
-    return {
-        "vocab_size": config["vocab_size"],
-        "embed_dim":  config["embed_dim"],
-        "lstm_units": config["lstm_units"],
-        "dense_units": config["dense_units"],
-        "dropout":    config["dropout"]
-    }
-
-
-def _evaluate_lstm_pytorch(model_dir: Path, test_df: pd.DataFrame) -> dict:
-    from sklearn.metrics import classification_report, roc_auc_score
-
-    arch = _load_lstm_arch(model_dir)
-    log.info("Loaded LSTM arch: %s", arch)
-
-    # Initialize model using updated class that matches training script
-    model = BiLSTMClassifier(**arch)
-    model.load_state_dict(torch.load(model_dir / "lstm_model.pt", map_location="cpu"))
-    model.eval()
-
-    word_index = _load_tokenizer(model_dir)
-    X = _texts_to_padded(test_df["clean_lstm"].values, word_index, MAX_LEN)
-    y = test_df["label_id"].values
-
-    all_probs  = []
-    batch_size = 64
-    with torch.no_grad():
-        for start in range(0, len(X), batch_size):
-            batch = torch.tensor(X[start:start + batch_size])
-            probs = model(batch).cpu().numpy()
-            all_probs.extend(probs)
-
-    y_prob = np.array(all_probs)
-    y_pred = (y_prob >= 0.5).astype(int)
-    report = classification_report(y, y_pred, output_dict=True)
-    return {
-        "model_type":     "lstm",
-        "accuracy":       report["accuracy"],
-        "auc":            float(roc_auc_score(y, y_prob)),
-        "f1_fake":        report["1"]["f1-score"],
-        "precision_fake": report["1"]["precision"],
-        "recall_fake":    report["1"]["recall"],
-    }
-
-
-def _evaluate_lstm_tensorflow(model_dir: Path, test_df: pd.DataFrame) -> dict:
-    """
-    Evaluate a TF/Keras LSTM model.
-    Supports:
-      - lstm_model.h5          (single-file SavedModel / legacy HDF5)
-      - <model_dir>/           (TF SavedModel directory with saved_model.pb)
-    """
-    from sklearn.metrics import classification_report, roc_auc_score
-
-    try:
-        import tensorflow as tf
-    except ImportError as exc:
-        raise ImportError(
-            "TensorFlow is required to evaluate this model artifact but is not installed.\n"
-            "Add `pip install tensorflow` to the 'Install dependencies' step in your workflow, "
-            "or re-train the model with the PyTorch trainer."
-        ) from exc
-
-    # Locate the model file / directory
-    h5_path = model_dir / "lstm_model.h5"
-    if h5_path.exists():
-        log.info("Loading Keras model from %s", h5_path)
-        model = tf.keras.models.load_model(str(h5_path))
-    elif (model_dir / "saved_model.pb").exists():
-        log.info("Loading TF SavedModel from %s", model_dir)
-        model = tf.keras.models.load_model(str(model_dir))
-    else:
-        raise FileNotFoundError("TF model file not found (expected lstm_model.h5 or saved_model.pb).")
-
-    word_index = _load_tokenizer(model_dir)
-    X = _texts_to_padded(test_df["clean_lstm"].values, word_index, MAX_LEN)
-    y = test_df["label_id"].values
-
-    log.info("Running TF inference on %d samples...", len(X))
-    y_prob = model.predict(X, batch_size=64, verbose=0).flatten()
-    y_pred = (y_prob >= 0.5).astype(int)
-    report = classification_report(y, y_pred, output_dict=True)
-    return {
-        "model_type":     "lstm",
-        "accuracy":       report["accuracy"],
-        "auc":            float(roc_auc_score(y, y_prob)),
-        "f1_fake":        report["1"]["f1-score"],
-        "precision_fake": report["1"]["precision"],
-        "recall_fake":    report["1"]["recall"],
-    }
-
-
-def evaluate_lstm(model_dir: Path, test_df: pd.DataFrame) -> dict:
-    """
-    Auto-detect whether the LSTM artifact was produced by PyTorch or TF/Keras
-    and dispatch to the appropriate evaluator.
-
-    PyTorch layout  : lstm_model.pt  + lstm_model_arch.pkl + tokenizer.pkl
-    TF/Keras layout : lstm_model.h5 (or saved_model.pb)   + tokenizer.pkl / tokenizer.json
-    """
-    backend = _detect_lstm_backend(model_dir)
-    if backend == "pytorch":
-        return _evaluate_lstm_pytorch(model_dir, test_df)
-    return _evaluate_lstm_tensorflow(model_dir, test_df)
 
 
 def evaluate_bert(model_dir: Path, test_df: pd.DataFrame) -> dict:
@@ -388,7 +158,7 @@ def main() -> None:
         download_and_extract_model(s3, model_data, model_dir)
         test_df = load_test_data(s3, tmp)
 
-        evaluators = {"nb": evaluate_nb, "lstm": evaluate_lstm, "bert": evaluate_bert}
+        evaluators = {"bert": evaluate_bert}
         if model_type not in evaluators:
             log.error("Unknown MODEL_TYPE: %s", model_type)
             sys.exit(1)
