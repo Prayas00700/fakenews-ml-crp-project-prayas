@@ -97,8 +97,6 @@ jobs:
           # Ensure sagemaker and dependencies are installed in the 3.10 env
           python3 -m pip install --upgrade pip
           python3 -m pip install boto3 sagemaker pandas torch
-          # Debug step: This will prove if sagemaker is installed
-          python3 -c "import sagemaker; print('SageMaker version:', sagemaker.__version__)"
           if [ "$MODEL_TYPE" == "bert" ]; then python3 -m pip install transformers; fi
 
       # ================================================================
