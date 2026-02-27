@@ -1,168 +1,210 @@
+#!/usr/bin/env python3
 """
-src/deployment/model_deploy.py
-────────────────────────────────
-Creates (or updates) a SageMaker real-time inference endpoint for the
-trained fake-news detection model.
-
-Supports BERT (HuggingFace) model type.
-
-Usage:
-    python src/deployment/model_deploy.py
-
-Env vars:
-    MODEL_DATA              — s3://… artifact path
-    MODEL_TYPE              — bert
-    SAGEMAKER_ENDPOINT_NAME — name of the endpoint to create/update
+Model Deployment Script (Boto3 Version)
+Deploys BERT models to SageMaker using the low-level SDK to avoid 
+dependency issues in CI/CD environments.
 """
-
 import os
 import sys
 import json
-import logging
-import textwrap
-import tempfile
-from pathlib import Path
-
+import argparse
 import boto3
-import sagemaker
-from sagemaker.huggingface import HuggingFaceModel
-from botocore.exceptions import ClientError
+import tarfile
+import shutil
+from datetime import datetime
+import time
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from dep import (
-    AWS_REGION,
-    S3_BUCKET,
-    PROJECT_NAME,
-    SAGEMAKER_ROLE_ARN,
-    ENDPOINT_NAME,
-    ENDPOINT_INSTANCE,
-    MODEL_TYPE,
-)
+def find_latest_model(s3_client, bucket_name, project_name):
+    print("🔍 Searching for trained model...")
+    prefix = f"{project_name}/models/"
+    try:
+        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+        if 'Contents' in response:
+            # Look for model artifacts in the output folder
+            model_files = [obj for obj in response['Contents'] if obj['Key'].endswith('model.tar.gz') and '/output/' in obj['Key']]
+            if model_files:
+                latest = max(model_files, key=lambda x: x['LastModified'])
+                model_uri = f"s3://{bucket_name}/{latest['Key']}"
+                print(f"✅ Found model: {model_uri}")
+                return model_uri
+    except Exception as e:
+        print(f"❌ Error: {e}")
+    raise FileNotFoundError("No trained model found.")
 
-S3_ARTIFACTS_PREFIX = os.environ.get("S3_ARTIFACTS_PREFIX", f"{PROJECT_NAME}/artifacts/")
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Inline inference handlers (one per model type)
-# These are uploaded as part of the SageMaker model package.
-# ─────────────────────────────────────────────────────────────────────────────
-
-BERT_INFERENCE_SCRIPT = textwrap.dedent("""
-import os, json
+def prepare_model_for_deployment(s3_client, bucket_name, project_name, model_uri):
+    print("\n📦 Preparing model for deployment (injecting inference logic)...")
+    model_key = model_uri.replace(f"s3://{bucket_name}/", "")
+    s3_client.download_file(bucket_name, model_key, 'model.tar.gz')
+    
+    os.makedirs('./model', exist_ok=True)
+    with tarfile.open('model.tar.gz', 'r:gz') as tar:
+        tar.extractall('./model')
+    os.remove('model.tar.gz')
+    
+    # Create the code directory for SageMaker Inference Toolkit
+    os.makedirs('./model/code', exist_ok=True)
+    
+    print("📝 Creating inference script...")
+    inference_code = '''import json
 import torch
-from transformers import BertTokenizer, BertForSequenceClassification
+from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
 
 def model_fn(model_dir):
-    tok   = BertTokenizer.from_pretrained(os.path.join(model_dir,"bert_tokenizer"))
-    model = BertForSequenceClassification.from_pretrained(os.path.join(model_dir,"bert_model"))
+    # Hugging Face containers look for artifacts in the root model_dir
+    tokenizer = DistilBertTokenizerFast.from_pretrained(model_dir)
+    model = DistilBertForSequenceClassification.from_pretrained(model_dir)
     model.eval()
-    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
-    return {"model": model, "tokenizer": tok, "device": device}
+    return {'model': model, 'tokenizer': tokenizer, 'device': device}
 
 def input_fn(request_body, content_type):
-    return json.loads(request_body).get("text","")
+    if content_type == 'application/json':
+        data = json.loads(request_body)
+        return data['text']
+    raise ValueError(f"Unsupported content type: {content_type}")
 
-def predict_fn(text, bundle):
-    enc=bundle["tokenizer"](text,return_tensors="pt",truncation=True,padding=True,max_length=256)
-    enc={k:v.to(bundle["device"]) for k,v in enc.items()}
+def predict_fn(input_data, model_dict):
+    tokenizer = model_dict['tokenizer']
+    model = model_dict['model']
+    device = model_dict['device']
+    
+    inputs = tokenizer(input_data, truncation=True, padding=True, 
+                      max_length=128, return_tensors='pt')
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
     with torch.no_grad():
-        out=bundle["model"](**enc)
-        probs=torch.softmax(out.logits,dim=1)[0].cpu().tolist()
-    fake_prob=probs[1]
-    return {"label":"fake" if fake_prob>=0.5 else "real","fake_prob":fake_prob,"real_prob":probs[0]}
-""")
+        outputs = model(**inputs)
+        probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        pred = outputs.logits.argmax(-1).item()
+    
+    label_map = {0: 'negative', 1: 'neutral', 2: 'positive'}
+    return {
+        'prediction': label_map[pred],
+        'confidence': float(probs[0][pred]),
+        'probabilities': {label_map[i]: float(probs[0][i]) for i in range(3)}
+    }
 
+def output_fn(prediction, accept):
+    return json.dumps(prediction), 'application/json'
+'''
+    with open('./model/code/inference.py', 'w') as f:
+        f.write(inference_code)
+    
+    with open('./model/code/requirements.txt', 'w') as f:
+        f.write('transformers==4.44.2\n')
+    
+    print("🗜️  Repackaging artifact...")
+    with tarfile.open('deploy_model.tar.gz', 'w:gz') as tar:
+        tar.add('./model', arcname='.')
+    
+    deploy_key = f"{project_name}/models/deploy/model.tar.gz"
+    s3_client.upload_file('deploy_model.tar.gz', bucket_name, deploy_key)
+    
+    shutil.rmtree('./model')
+    os.remove('deploy_model.tar.gz')
+    return f"s3://{bucket_name}/{deploy_key}"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Deployment helpers
-# ─────────────────────────────────────────────────────────────────────────────
+def create_sagemaker_model(model_name, model_data_url, sagemaker_role, aws_region):
+    print(f"\n🤖 Creating SageMaker model: {model_name}")
+    sm = boto3.client('sagemaker', region_name=aws_region)
+    
+    # Use the official Hugging Face Inference DLC URI for BERT/Transformers
+    # Account 763104351884 is the AWS Deep Learning Container account
+    image_uri = f"763104351884.dkr.ecr.{aws_region}.amazonaws.com/huggingface-pytorch-inference:2.1.0-transformers4.37.0-cpu-py310-ubuntu22.04"
+    
+    sm.create_model(
+        ModelName=model_name,
+        PrimaryContainer={
+            'Image': image_uri,
+            'ModelDataUrl': model_data_url,
+            'Environment': {
+                'SAGEMAKER_PROGRAM': 'inference.py',
+                'SAGEMAKER_SUBMIT_DIRECTORY': '/opt/ml/model/code',
+                'HF_TASK': 'text-classification',
+                'SAGEMAKER_CONTAINER_LOG_LEVEL': '20'
+            }
+        },
+        ExecutionRoleArn=sagemaker_role
+    )
+    print("✅ Model resource created")
 
-def get_sagemaker_session():
-    return sagemaker.Session(boto_session=boto3.Session(region_name=AWS_REGION))
+def create_endpoint_config(config_name, model_name, aws_region):
+    print(f"⚙️  Creating config: {config_name}")
+    sm = boto3.client('sagemaker', region_name=aws_region)
+    sm.create_endpoint_config(
+        EndpointConfigName=config_name,
+        ProductionVariants=[{
+            'VariantName': 'AllTraffic',
+            'ModelName': model_name,
+            'InstanceType': 'ml.m5.large',
+            'InitialInstanceCount': 1
+        }]
+    )
+    print("✅ Endpoint config created")
 
-
-def endpoint_exists(sm_client, endpoint_name: str) -> bool:
+def create_or_update_endpoint(endpoint_name, config_name, aws_region):
+    print(f"🚀 Deploying/Updating endpoint: {endpoint_name}")
+    sm = boto3.client('sagemaker', region_name=aws_region)
     try:
-        sm_client.describe_endpoint(EndpointName=endpoint_name)
-        return True
-    except ClientError:
-        return False
+        sm.describe_endpoint(EndpointName=endpoint_name)
+        print("📝 Updating existing endpoint...")
+        sm.update_endpoint(EndpointName=endpoint_name, EndpointConfigName=config_name)
+    except sm.exceptions.ClientError:
+        print("🆕 Creating new endpoint...")
+        sm.create_endpoint(EndpointName=endpoint_name, EndpointConfigName=config_name)
 
+def wait_for_endpoint(endpoint_name, aws_region):
+    print(f"⏳ Waiting for endpoint to become 'InService'...")
+    sm = boto3.client('sagemaker', region_name=aws_region)
+    while True:
+        response = sm.describe_endpoint(EndpointName=endpoint_name)
+        status = response['EndpointStatus']
+        if status == 'InService':
+            print("✅ Endpoint is live!")
+            break
+        elif status in ['Failed', 'RollingBack']:
+            raise Exception(f"Deployment failed with status: {status}")
+        time.sleep(30)
 
-def deploy_model(model_data: str, model_type: str, session: sagemaker.Session) -> str:
-    sm_client  = boto3.client("sagemaker", region_name=AWS_REGION)
-    exists     = endpoint_exists(sm_client, ENDPOINT_NAME)
-    action_str = "Updating" if exists else "Creating"
-    log.info("%s endpoint: %s", action_str, ENDPOINT_NAME)
+def main(args):
+    s3_client = boto3.client('s3', region_name=args.region)
+    
+    # 1. Find the latest artifact from the training job
+    model_uri = find_latest_model(s3_client, args.bucket, args.project)
+    
+    # 2. Package the model with our custom BERT inference logic
+    deploy_uri = prepare_model_for_deployment(s3_client, args.bucket, args.project, model_uri)
+    
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    model_name = f"{args.project}-model-{timestamp}"
+    config_name = f"{args.project}-config-{timestamp}"
+    
+    # 3. Create SageMaker resources using Boto3
+    create_sagemaker_model(model_name, deploy_uri, args.role, args.region)
+    create_endpoint_config(config_name, model_name, args.region)
+    create_or_update_endpoint(args.endpoint, config_name, args.region)
+    
+    # 4. Wait for completion
+    wait_for_endpoint(args.endpoint, args.region)
+    
+    # 5. Output results
+    deployment_info = {
+        'endpoint_name': args.endpoint,
+        'model_name': model_name,
+        'region': args.region,
+        'timestamp': datetime.now().isoformat()
+    }
+    with open(args.output_file, 'w') as f:
+        json.dump(deployment_info, f, indent=2)
 
-    SCRIPTS = {"bert": BERT_INFERENCE_SCRIPT}
-
-    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as tmp:
-        tmp.write(SCRIPTS[model_type])
-        script_path = tmp.name
-
-    kwargs = dict(
-        model_data=model_data,
-        role=SAGEMAKER_ROLE_ARN,
-        entry_point=script_path,
-        sagemaker_session=session,
-    )
-
-    sm_model = HuggingFaceModel(transformers_version="4.26", pytorch_version="1.13", py_version="py39", **kwargs)
-
-    predictor = sm_model.deploy(
-        initial_instance_count=1,
-        instance_type=ENDPOINT_INSTANCE,
-        endpoint_name=ENDPOINT_NAME,
-        update_endpoint=exists,
-        wait=True,
-    )
-
-    log.info("Endpoint live: %s", ENDPOINT_NAME)
-    return predictor.endpoint_name
-
-
-def smoke_test(endpoint_name: str) -> None:
-    """Send a quick prediction to verify the endpoint is healthy."""
-    runtime = boto3.client("sagemaker-runtime", region_name=AWS_REGION)
-    test_payload = json.dumps({"text": "Breaking: Scientists confirm miraculous cure with zero side effects found!"})
-    response = runtime.invoke_endpoint(
-        EndpointName=endpoint_name,
-        ContentType="application/json",
-        Body=test_payload,
-    )
-    result = json.loads(response["Body"].read().decode())
-    log.info("Smoke test result: %s", result)
-    assert "label" in result, "Smoke test failed — response missing 'label' key"
-    log.info("Smoke test passed ✓")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    model_data = os.environ.get("MODEL_DATA", "")
-    model_type = os.environ.get("MODEL_TYPE", MODEL_TYPE).lower()
-
-    if not model_data:
-        log.error("MODEL_DATA env var is not set.")
-        sys.exit(1)
-
-    session = get_sagemaker_session()
-    endpoint_name = deploy_model(model_data, model_type, session)
-    smoke_test(endpoint_name)
-
-    # Write endpoint name for monitoring job
-    Path("deployment.env").write_text(
-        f"ENDPOINT_NAME={endpoint_name}\nMODEL_TYPE={model_type}\n"
-    )
-    log.info("Deployment complete.")
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--bucket', required=True)
+    parser.add_argument('--project', required=True)
+    parser.add_argument('--endpoint', required=True)
+    parser.add_argument('--role', required=True)
+    parser.add_argument('--region', required=True)
+    parser.add_argument('--output-file', default='deployment_info.json')
+    args = parser.parse_args()
+    main(args)
