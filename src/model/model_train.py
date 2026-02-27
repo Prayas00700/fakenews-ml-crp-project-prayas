@@ -147,19 +147,18 @@ NB_TRAIN_SCRIPT = textwrap.dedent("""\
 
 BERT_TRAIN_SCRIPT = textwrap.dedent("""\
     \"\"\"BERT fine-tuning script — runs inside SageMaker Training container.\"\"\"
-    import subprocess, sys
-
-    # Install missing deps explicitly.
-    # boto3 create_training_job does NOT auto-run pip install -r requirements.txt —
-    # only the SageMaker Python SDK Estimator does that. We bootstrap here instead.
-    # torch is intentionally excluded: it is pre-installed in the PyTorch DLC and
-    # reinstalling it via pip overwrites the CUDA-compiled binaries, breaking GPU.
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install", "--quiet",
+    # ── Bootstrap: install missing packages before any other imports ─────────
+    # boto3 create_training_job does NOT auto-process requirements.txt.
+    # Only the SageMaker Python SDK Estimator does that.
+    # torch is excluded: pre-installed as CUDA-compiled binaries in the DLC;
+    # reinstalling via pip overwrites them and breaks GPU inference.
+    import subprocess as _sp, sys as _sys
+    _sp.check_call([
+        _sys.executable, "-m", "pip", "install", "--quiet",
         "transformers>=4.35.0", "accelerate",
         "scikit-learn", "pandas", "numpy", "pyarrow",
     ])
-
+    # ─────────────────────────────────────────────────────────────────────────
     import os, json, pickle, argparse, glob
     import pandas as pd, numpy as np, torch
     from torch.utils.data import Dataset, DataLoader
