@@ -100,9 +100,15 @@ jobs:
       # ================================================================
       # Step 6: Deploy model to SageMaker endpoint
       # ================================================================
-      - name: Deploy model to SageMaker endpoint
-        run: python src/deployment/model_deploy.py
-
+      - name: Deploy model to SageMaker
+        run: |
+          python src/model_deploy.py \
+            --bucket ${{ vars.S3_BUCKET }} \
+            --project ${{ vars.PROJECT_NAME }} \
+            --endpoint ${{ vars.ENDPOINT_NAME }} \
+            --role ${{ secrets.SAGEMAKER_ROLE_ARN }} \
+            --region ${{ vars.AWS_REGION }} \
+            --output-file deployment_info.json
       # ================================================================
       # Step 7: Read deployed endpoint name
       # ================================================================
