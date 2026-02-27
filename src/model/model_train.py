@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 SKLEARN_IMAGE   = f"683313688378.dkr.ecr.{AWS_REGION}.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3"
-PT_GPU_IMAGE    = f"763104351884.dkr.ecr.{AWS_REGION}.amazonaws.com/pytorch-training:2.1.0-gpu-py310-cu121-ubuntu20.04-sagemaker"
+PT_GPU_IMAGE    = f"763104351884.dkr.ecr.{AWS_REGION}.amazonaws.com/pytorch-training:2.3.0-gpu-py311-cu121-ubuntu20.04-sagemaker-v1.0"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,18 +147,6 @@ NB_TRAIN_SCRIPT = textwrap.dedent("""\
 
 BERT_TRAIN_SCRIPT = textwrap.dedent("""\
     \"\"\"BERT fine-tuning script — runs inside SageMaker Training container.\"\"\"
-    # ── Bootstrap: install missing packages before any other imports ─────────
-    # boto3 create_training_job does NOT auto-process requirements.txt.
-    # Only the SageMaker Python SDK Estimator does that.
-    # torch is excluded: pre-installed as CUDA-compiled binaries in the DLC;
-    # reinstalling via pip overwrites them and breaks GPU inference.
-    import subprocess as _sp, sys as _sys
-    _sp.check_call([
-        _sys.executable, "-m", "pip", "install", "--quiet",
-        "transformers>=4.35.0", "accelerate",
-        "scikit-learn", "pandas", "numpy", "pyarrow",
-    ])
-    # ─────────────────────────────────────────────────────────────────────────
     import os, json, pickle, argparse, glob
     import pandas as pd, numpy as np, torch
     from torch.utils.data import Dataset, DataLoader
@@ -265,15 +253,43 @@ SCRIPT_MAP = {
     "bert": ("train_bert.py", BERT_TRAIN_SCRIPT),
 }
 
-# Per-model requirements bundled into sourcedir.tar.gz.
-# SageMaker auto-runs `pip install -r requirements.txt` before the entry-point.
+# ─────────────────────────────────────────────────────────────────────────────
+# Thin wrapper scripts — used as sagemaker_program entry point.
 #
-# IMPORTANT rules:
-#   - Never list tensorflow here — reinstalling TF inside the managed TF
-#     container clobbers pre-compiled kernels and causes symbol errors.
-#   - torch must be listed for bert — even though the PT container has it,
-#     listing it ensures transformers can locate it correctly at runtime.
-#   - Only add packages genuinely missing from the managed container.
+# The SageMaker DLC bootstrap calls sagemaker_program first, which lets it
+# run `pip install -r requirements.txt` beforehand. The wrapper then
+# subprocess-calls the real training script so that all freshly installed
+# packages (transformers, etc.) are importable in a clean Python process.
+# Without this two-process pattern, packages installed by the bootstrap are
+# sometimes not visible to the already-running Python interpreter.
+# ─────────────────────────────────────────────────────────────────────────────
+
+NB_WRAPPER_SCRIPT = """import subprocess, sys
+subprocess.check_call([sys.executable, "train_nb.py"] + sys.argv[1:])
+"""
+
+BERT_WRAPPER_SCRIPT = """import subprocess, sys
+subprocess.check_call([sys.executable, "train_bert.py"] + sys.argv[1:])
+"""
+
+WRAPPER_MAP = {
+    "nb":   ("train_nb_wrapper.py",   NB_WRAPPER_SCRIPT),
+    "bert": ("train_bert_wrapper.py", BERT_WRAPPER_SCRIPT),
+}
+
+# Per-model requirements bundled into sourcedir.tar.gz alongside the training script.
+#
+# HOW IT WORKS (critical):
+#   The SageMaker DLC bootstrap runner reads requirements.txt from the extracted
+#   sourcedir and runs `pip install -r requirements.txt` BEFORE calling
+#   sagemaker_program. This only works because we set sagemaker_submit_directory
+#   AND sagemaker_program as hyperparameters — the DLC bootstrap handles it.
+#   Raw boto3 create_training_job alone does NOT process requirements.txt.
+#
+# TORCH RULE:
+#   torch MUST be pinned here to match the container version (2.3.1 for the
+#   2.3.0-gpu-py311 DLC). This tells pip "already satisfied" and ensures
+#   transformers can resolve torch correctly without reinstalling it.
 REQUIREMENTS_MAP = {
     "nb": (
         "nltk\n"
@@ -283,10 +299,11 @@ REQUIREMENTS_MAP = {
         "pyarrow\n"
     ),
     "bert": (
-        # torch is pre-installed in the PyTorch DLC — DO NOT reinstall it.
-        # Reinstalling torch via pip causes CUDA driver conflicts in the container.
-        # transformers is not pre-installed, so it must be listed here.
-        "transformers>=4.35.0\n"
+        # Pin torch to the version pre-installed in the 2.3.0-gpu-py311 DLC.
+        # pip will see "already satisfied" and skip reinstalling, but the pin
+        # ensures transformers resolves its torch dependency correctly.
+        "torch==2.3.1\n"
+        "transformers==4.44.2\n"
         "accelerate\n"
         "pandas\n"
         "numpy\n"
@@ -310,21 +327,36 @@ def get_clients():
 def upload_training_script(s3: boto3.client, script_content: str, script_name: str,
                             bucket: str, prefix: str, model_type: str = "bert") -> str:
     """
-    Package the training script + requirements.txt into a sourcedir.tar.gz
-    and upload it to S3.
+    Package wrapper + real training script + requirements.txt into sourcedir.tar.gz
+    and upload to S3.
 
-    SageMaker reads requirements.txt from the sourcedir at container startup
-    and runs `pip install -r requirements.txt` before the entry-point.
-    Only packages absent from the managed container are listed — critically,
-    tensorflow and torch are never reinstalled to avoid binary conflicts.
+    Layout inside the tar:
+        train_<type>_wrapper.py   ← sagemaker_program entry point
+        train_<type>.py           ← real training logic
+        requirements.txt          ← pip-installed by DLC bootstrap before entry point
+
+    The DLC bootstrap (triggered by sagemaker_submit_directory + sagemaker_program
+    hyperparameters) runs:
+        1. pip install -r requirements.txt
+        2. python train_<type>_wrapper.py <hyperparams>
+
+    The wrapper then subprocess-calls train_<type>.py in a fresh Python process,
+    ensuring all newly installed packages are importable.
     """
     import tarfile, io
 
     requirements_content = REQUIREMENTS_MAP.get(model_type, "")
+    wrapper_name, wrapper_content = WRAPPER_MAP[model_type]
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        # ── Training script ──────────────────────────────────────────────────
+        # ── Wrapper script (sagemaker_program) ───────────────────────────────
+        wrapper_bytes = wrapper_content.encode("utf-8")
+        wrap_info     = tarfile.TarInfo(name=wrapper_name)
+        wrap_info.size = len(wrapper_bytes)
+        tar.addfile(wrap_info, io.BytesIO(wrapper_bytes))
+
+        # ── Real training script ─────────────────────────────────────────────
         script_bytes = script_content.encode("utf-8")
         info         = tarfile.TarInfo(name=script_name)
         info.size    = len(script_bytes)
@@ -348,7 +380,10 @@ def upload_training_script(s3: boto3.client, script_content: str, script_name: s
     )
     s3_uri = f"s3://{bucket}/{s3_key}"
     logger.info("Training script uploaded: %s", s3_uri)
-    return s3_uri, script_name
+    logger.info("  Wrapper   : %s", wrapper_name)
+    logger.info("  Script    : %s", script_name)
+    logger.info("  sourcedir : %s", s3_uri)
+    return s3_uri, wrapper_name   # return wrapper_name — this is sagemaker_program
 
 
 def build_hyperparameters(model_type: str, bucket: str, prefix: str, epochs: int, batch_size: int) -> dict:
@@ -361,7 +396,7 @@ def build_hyperparameters(model_type: str, bucket: str, prefix: str, epochs: int
     }
     if model_type == "nb":
         base["max-features"] = str(TFIDF_MAX_FEATURES)
-        base["sagemaker_program"] = "train_nb.py"
+        base["sagemaker_program"] = "train_nb_wrapper.py"   # wrapper → DLC installs reqs first
     elif model_type == "bert":
         base.update({
             "bert-model":  BERT_MODEL_NAME,
@@ -369,7 +404,7 @@ def build_hyperparameters(model_type: str, bucket: str, prefix: str, epochs: int
             "batch-size":  str(BERT_BATCH_SIZE),
             "epochs":      str(BERT_EPOCHS),
             "lr":          str(BERT_LR),
-            "sagemaker_program": "train_bert.py",
+            "sagemaker_program": "train_bert_wrapper.py",   # wrapper → DLC installs reqs first
         })
     return base
 
