@@ -259,7 +259,8 @@ SCRIPT_MAP = {
 # IMPORTANT rules:
 #   - Never list tensorflow here — reinstalling TF inside the managed TF
 #     container clobbers pre-compiled kernels and causes symbol errors.
-#   - Never list torch here for bert — the PT container already has it.
+#   - torch must be listed for bert — even though the PT container has it,
+#     listing it ensures transformers can locate it correctly at runtime.
 #   - Only add packages genuinely missing from the managed container.
 REQUIREMENTS_MAP = {
     "nb": (
@@ -270,8 +271,11 @@ REQUIREMENTS_MAP = {
         "pyarrow\n"
     ),
     "bert": (
-        # PyTorch container does NOT ship transformers — must install it
+        # torch must be listed so transformers can locate it correctly.
+        # transformers is not pre-installed in the PT container.
+        "torch\n"
         "transformers>=4.35.0\n"
+        "accelerate\n"
         "pandas\n"
         "numpy\n"
         "scikit-learn\n"
