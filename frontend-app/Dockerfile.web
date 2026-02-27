@@ -6,8 +6,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/app.py .
-COPY frontend/templates/ ./templates/
-COPY frontend/static/    ./static/
+
+# index.html lives at the root of the build context — copy into templates/
+COPY index.html ./templates/index.html
+
+# Copy static assets if they exist
+COPY static/ ./static/
 
 EXPOSE 5000
 
