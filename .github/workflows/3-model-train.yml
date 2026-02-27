@@ -40,12 +40,12 @@ on:
 # Environment variables — ALL sourced from GitHub Secrets / Variables
 # ─────────────────────────────────────────────────────────────────────────────
 env:
-  AWS_REGION:              ${{ vars.AWS_REGION }}
-  S3_BUCKET:               ${{ secrets.S3_BUCKET }}
-  PROJECT_NAME:            ${{ vars.PROJECT_NAME }}
-  SAGEMAKER_ROLE_ARN:      ${{ secrets.SAGEMAKER_ROLE_ARN }}
+  AWS_REGION:               ${{ vars.AWS_REGION }}
+  S3_BUCKET:                ${{ secrets.S3_BUCKET }}
+  PROJECT_NAME:             ${{ vars.PROJECT_NAME }}
+  SAGEMAKER_ROLE_ARN:       ${{ secrets.SAGEMAKER_ROLE_ARN }}
   SAGEMAKER_INSTANCE_TRAIN: ${{ vars.SAGEMAKER_INSTANCE_TRAIN || 'ml.g4dn.xlarge' }}
-  SAGEMAKER_INSTANCE:      ${{ vars.SAGEMAKER_INSTANCE       || 'ml.m5.xlarge' }}
+  SAGEMAKER_INSTANCE:       ${{ vars.SAGEMAKER_INSTANCE       || 'ml.m5.xlarge' }}
 
 jobs:
   train-model:
@@ -88,22 +88,21 @@ jobs:
       # Step 3: Setup Python
       # ================================================================
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.11'
 
       # ================================================================
       # Step 4: Install dependencies
       # ================================================================
       - name: Install dependencies
-        run: |
-          pip install boto3 sagemaker
+        run: pip install boto3 sagemaker
 
       # ================================================================
       # Step 5: Configure AWS credentials
       # ================================================================
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region:     ${{ env.AWS_REGION }}
@@ -129,6 +128,23 @@ jobs:
 
       # ================================================================
       # Step 7: Start SageMaker Training Job
+      #
+      # model_train.py handles everything:
+      #   - Builds a sourcedir.tar.gz containing:
+      #       train_<type>_wrapper.py  (sagemaker_program — DLC entry point)
+      #       train_<type>.py          (real training logic)
+      #       requirements.txt         (pip-installed by DLC before entry point)
+      #   - Uploads sourcedir.tar.gz to S3
+      #   - Calls boto3 create_training_job with sagemaker_submit_directory
+      #     and sagemaker_program hyperparameters
+      #
+      # The DLC bootstrap then:
+      #   1. Extracts sourcedir.tar.gz
+      #   2. Runs: pip install -r requirements.txt
+      #   3. Runs: python train_<type>_wrapper.py <hyperparams>
+      #
+      # The wrapper subprocess-calls the real script in a fresh Python
+      # process so all newly installed packages are importable.
       # ================================================================
       - name: Start SageMaker Training Job
         id: start-training
@@ -153,21 +169,19 @@ jobs:
         id: get-model
         run: |
           python - <<'EOF'
-          import boto3
-          import os
+          import boto3, os
 
           job_name = "${{ steps.start-training.outputs.job_name }}"
           region   = "${{ env.AWS_REGION }}"
 
-          sagemaker = boto3.client('sagemaker', region_name=region)
-          response  = sagemaker.describe_training_job(TrainingJobName=job_name)
+          sm       = boto3.client('sagemaker', region_name=region)
+          response = sm.describe_training_job(TrainingJobName=job_name)
           model_uri = response['ModelArtifacts']['S3ModelArtifacts']
 
           print(f"Model saved to: {model_uri}")
 
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"model_uri={model_uri}\n")
-
           EOF
 
       # ================================================================
