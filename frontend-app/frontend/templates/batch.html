@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Batch Analysis — Veritas</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="noise-overlay"></div>
+
+    <div class="masthead">
+        <div class="masthead-inner">
+            <div class="masthead-brand">
+                <span class="brand-icon">⚡</span>
+                <span class="brand-name">VERITAS</span>
+                <span class="brand-tag">AI FACT-CHECKER</span>
+            </div>
+            <nav class="masthead-nav">
+                <a href="/" class="nav-link">Single Article</a>
+                <a href="/batch" class="nav-link active">Batch / CSV</a>
+            </nav>
+        </div>
+    </div>
+
+    <main class="main-content">
+        <div class="hero-section">
+            <div class="hero-text">
+                <h1 class="hero-title">Batch<br><em>analysis</em></h1>
+                <p class="hero-sub">Upload a CSV containing multiple articles. Get instant verdicts, confidence scores and a downloadable report — all in one pass.</p>
+            </div>
+            <div class="hero-stats">
+                <div class="stat-pill">CSV Upload</div>
+                <div class="stat-pill">Bulk Processing</div>
+                <div class="stat-pill">Export Results</div>
+            </div>
+        </div>
+
+        <div class="card input-card">
+            <div class="info-banner">
+                <div class="info-banner-icon">📋</div>
+                <div class="info-banner-body">
+                    <strong>Required CSV columns:</strong>
+                    <div class="col-chips">
+                        <code>title</code>
+                        <code>text</code>
+                    </div>
+                    <p class="info-note">The <code>title</code> column is optional — the model will use <code>text</code> alone if title is missing.</p>
+                    <a href="#" onclick="downloadSample()" class="sample-link">↓ Download sample CSV</a>
+                </div>
+            </div>
+
+            <form id="csvForm">
+                <div class="upload-zone" id="uploadZone">
+                    <input type="file" id="csvFile" name="file" accept=".csv" required>
+                    <div class="upload-zone-inner">
+                        <div class="upload-icon">
+                            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                <polyline points="17 8 12 3 7 8"/>
+                                <line x1="12" y1="3" x2="12" y2="15"/>
+                            </svg>
+                        </div>
+                        <p class="upload-label"><strong>Drop CSV here</strong> or click to browse</p>
+                        <p class="upload-hint">CSV files only, up to 10MB</p>
+                    </div>
+                    <div id="fileName" class="file-chosen"></div>
+                </div>
+
+                <div class="form-actions">
+                    <button type="submit" class="btn-analyse">
+                        <span class="btn-label">Run Analysis</span>
+                        <span class="btn-arrow">→</span>
+                    </button>
+                    <button type="button" class="btn-reset" onclick="resetUpload()">Clear</button>
+                </div>
+            </form>
+        </div>
+
+        <div id="loading" class="loading-overlay" style="display:none;">
+            <div class="loading-inner">
+                <div class="scanner-ring"></div>
+                <p class="loading-text">Processing articles…</p>
+            </div>
+        </div>
+
+        <div id="results" class="card result-card" style="display:none;">
+            <h2 class="section-title">Batch Results</h2>
+
+            <div id="summary" class="summary-grid"></div>
+
+            <div class="table-wrapper">
+                <table id="resultsTable">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Headline</th>
+                            <th>Verdict</th>
+                            <th>Fake Probability</th>
+                            <th>Confidence</th>
+                        </tr>
+                    </thead>
+                    <tbody id="resultsBody"></tbody>
+                </table>
+            </div>
+
+            <div class="form-actions" style="margin-top:24px;">
+                <button class="btn-analyse" onclick="downloadResults()">
+                    <span class="btn-label">Download Report</span>
+                    <span class="btn-arrow">↓</span>
+                </button>
+            </div>
+        </div>
+    </main>
+
+    <footer class="site-footer">
+        <p>⚠ For research & educational use only. Always verify with primary sources.</p>
+    </footer>
+
+    <script src="{{ url_for('static', filename='js/batch.js') }}"></script>
+</body>
+</html>
