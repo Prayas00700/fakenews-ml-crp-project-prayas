@@ -198,6 +198,13 @@ def main(args):
     with open(args.output_file, 'w') as f:
         json.dump(deployment_info, f, indent=2)
 
+    # NEW: Create the deployment.env file for Step 7 of the YAML
+    with open("deployment.env", "w") as f:
+        f.write(f"ENDPOINT_NAME={args.endpoint}\n")
+        f.write(f"MODEL_TYPE=bert\n")
+    
+    print(f"✅ Created deployment.env and {args.output_file}")
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--bucket', required=True)
