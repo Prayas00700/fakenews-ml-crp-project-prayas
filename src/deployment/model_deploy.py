@@ -74,9 +74,6 @@ def predict_fn(text, bundle):
         probs=torch.softmax(out.logits,dim=1)[0].cpu().tolist()
     fake_prob=probs[1]
     return {"label":"fake" if fake_prob>=0.5 else "real","fake_prob":fake_prob,"real_prob":probs[0]}
-
-def output_fn(prediction, accept):
-    return json.dumps(prediction), "application/json"
 """)
 
 
