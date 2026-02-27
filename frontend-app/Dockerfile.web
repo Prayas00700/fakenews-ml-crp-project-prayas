@@ -2,17 +2,18 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
+# Copy requirements and install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY backend/app.py .
-
-# index.html lives at the root of the build context — copy into templates/
-COPY index.html ./templates/index.html
-
-# Copy static assets if they exist
-COPY static/ ./static/
+# Preserve exact local directory structure inside the container
+COPY backend/ ./backend/
+COPY frontend/ ./frontend/
 
 EXPOSE 5000
 
+# Change working directory to backend so relative paths work exactly like locally
+WORKDIR /app/backend
+
+# Run the application
 CMD ["python", "app.py"]

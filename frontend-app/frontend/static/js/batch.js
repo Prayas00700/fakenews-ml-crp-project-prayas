@@ -127,7 +127,7 @@ function downloadResults() {
     });
 
     const date = new Date().toISOString().slice(0, 10);
-    download(csv, `veritas_results_${date}.csv`, 'text/csv');
+    download(csv, `fakenews_ai_results_${date}.csv`, 'text/csv');
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────

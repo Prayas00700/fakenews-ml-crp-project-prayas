@@ -26,15 +26,16 @@ document.getElementById('predictionForm').addEventListener('submit', async (e) =
             body:    JSON.stringify({ title, text }),
         });
 
-        if (!response.ok) {
-            const err = await response.json();
-            throw new Error(err.detail || err.error || 'Prediction failed');
+        const result = await response.json();
+
+        // Failsafe: Catch HTTP errors OR backend errors masquerading as 200 OK
+        if (!response.ok || result.detail || result.error) {
+            throw new Error(result.detail || result.error || 'Prediction failed');
         }
 
-        const result = await response.json();
         displayResult(result);
     } catch (err) {
-        alert('Error: ' + err.message);
+        alert('Backend Error:\n' + err.message);
     } finally {
         hideLoading();
     }
@@ -42,32 +43,66 @@ document.getElementById('predictionForm').addEventListener('submit', async (e) =
 
 // ── Display result ────────────────────────────────────────────────────────
 function displayResult(result) {
-    const isFake     = result.prediction === 1;
-    const pct        = (result.probability * 100).toFixed(1);
-    const confClass  = getConfClass(result.confidence, isFake);
-    const rec        = getRecommendation(isFake, result.confidence);
+    console.log("Raw API Response:", result); // Helpful for browser console debugging
 
+    // Extract values with fallbacks for capitalized/alternative keys
+    const predictionVal = result.prediction ?? result.Prediction;
+    const probabilityVal = result.probability ?? result.Probability ?? result.score;
+    const labelVal = result.label ?? result.Label;
+    
+    // FAILSAFE: If the essential data is entirely missing or nested differently
+    if (predictionVal === undefined && probabilityVal === undefined) {
+        document.getElementById('resultContent').innerHTML = `
+            <div class="verdict-block fake">
+                <div class="verdict-icon">⚠️</div>
+                <div>
+                    <div class="verdict-title">Data Mismatch</div>
+                    <div class="verdict-sub">The Python backend returned an unexpected JSON structure. Ensure your Python API returns exact lowercase keys: 'prediction', 'probability', 'label', 'confidence', 'interpretation'.</div>
+                </div>
+            </div>
+            <div style="background:var(--surface-2); padding:16px; border-radius:var(--radius); margin-top:16px; font-family:var(--font-mono); font-size:0.85rem; overflow-x:auto; color:var(--accent);">
+                <strong>Raw Backend Output:</strong><br><br>
+                <pre>${JSON.stringify(result, null, 2)}</pre>
+            </div>
+        `;
+        const resultsDiv = document.getElementById('results');
+        resultsDiv.style.display = 'block';
+        resultsDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        return;
+    }
+
+    // Safely parse the values
+    const isFake = (predictionVal == 1 || String(labelVal).toLowerCase() === 'fake');
+    const parsedProb = parseFloat(probabilityVal);
+    const pct = isNaN(parsedProb) ? 'NaN' : (parsedProb * 100).toFixed(1);
+    
+    const interpretationVal = result.interpretation ?? result.Interpretation ?? 'No interpretation provided.';
+    const confidenceVal = result.confidence ?? result.Confidence ?? 'UNDEFINED';
+    const confClass  = getConfClass(confidenceVal, isFake);
+    const rec        = getRecommendation(isFake, confidenceVal);
+
+    // Render the normal UI
     document.getElementById('resultContent').innerHTML = `
         <div class="verdict-block ${isFake ? 'fake' : 'real'}">
             <div class="verdict-icon">${isFake ? '🚨' : '✅'}</div>
             <div>
                 <div class="verdict-title">${isFake ? 'Likely Fake' : 'Likely Real'}</div>
-                <div class="verdict-sub">${result.interpretation}</div>
+                <div class="verdict-sub">${interpretationVal}</div>
             </div>
         </div>
 
         <div class="metrics-row">
             <div class="metric-box">
-                <div class="metric-value">${isFake ? pct + '%' : (100 - parseFloat(pct)).toFixed(1) + '%'}</div>
+                <div class="metric-value">${isFake && pct !== 'NaN' ? pct + '%' : (!isFake && pct !== 'NaN' ? (100 - parseFloat(pct)).toFixed(1) + '%' : 'NaN')}</div>
                 <div class="metric-label">${isFake ? 'Fake' : 'Real'} probability</div>
             </div>
             <div class="metric-box">
-                <div class="metric-value">${result.label}</div>
+                <div class="metric-value">${labelVal || 'UNDEFINED'}</div>
                 <div class="metric-label">Verdict</div>
             </div>
             <div class="metric-box">
                 <div class="metric-value" style="font-size:1.2rem;">
-                    <span class="conf-badge ${confClass}">${result.confidence}</span>
+                    <span class="conf-badge ${confClass}">${confidenceVal}</span>
                 </div>
                 <div class="metric-label">Confidence</div>
             </div>
