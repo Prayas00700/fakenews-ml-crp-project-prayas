@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 SKLEARN_IMAGE   = f"683313688378.dkr.ecr.{AWS_REGION}.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3"
-PT_GPU_IMAGE    = f"763104351884.dkr.ecr.{AWS_REGION}.amazonaws.com/pytorch-training:2.0.0-gpu-py310"
+PT_GPU_IMAGE    = f"763104351884.dkr.ecr.{AWS_REGION}.amazonaws.com/pytorch-training:2.1.0-gpu-py310-cu121-ubuntu20.04-sagemaker"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,9 +271,9 @@ REQUIREMENTS_MAP = {
         "pyarrow\n"
     ),
     "bert": (
-        # torch must be listed so transformers can locate it correctly.
-        # transformers is not pre-installed in the PT container.
-        "torch\n"
+        # torch is pre-installed in the PyTorch DLC — DO NOT reinstall it.
+        # Reinstalling torch via pip causes CUDA driver conflicts in the container.
+        # transformers is not pre-installed, so it must be listed here.
         "transformers>=4.35.0\n"
         "accelerate\n"
         "pandas\n"
@@ -384,6 +384,9 @@ def start_training_job(
 
     hyperparams = build_hyperparameters(model_type, bucket, prefix, epochs, batch_size)
     hyperparams["sagemaker_submit_directory"] = sourcedir_uri
+
+    logger.info("Using container image: %s", image)
+    logger.info("Using instance type  : %s", instance)
 
     response = sm.create_training_job(
         TrainingJobName=job_name,
