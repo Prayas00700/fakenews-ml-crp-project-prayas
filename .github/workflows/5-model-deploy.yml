@@ -103,7 +103,7 @@ jobs:
       - name: Deploy model to SageMaker
         run: |
           python src/deployment/model_deploy.py \
-            --bucket ${{ vars.S3_BUCKET }} \
+            --bucket ${{ secrets.S3_BUCKET }} \
             --project ${{ vars.PROJECT_NAME }} \
             --endpoint ${{ vars.ENDPOINT_NAME }} \
             --role ${{ secrets.SAGEMAKER_ROLE_ARN }} \
