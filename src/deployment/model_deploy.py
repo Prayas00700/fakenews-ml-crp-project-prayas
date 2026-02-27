@@ -137,7 +137,7 @@ def create_endpoint_config(config_name, model_name, aws_region):
         ProductionVariants=[{
             'VariantName': 'AllTraffic',
             'ModelName': model_name,
-            'InstanceType': 'ml.m5.large',
+            'InstanceType': 'ml.g4dn.xlarge',
             'InitialInstanceCount': 1
         }]
     )
