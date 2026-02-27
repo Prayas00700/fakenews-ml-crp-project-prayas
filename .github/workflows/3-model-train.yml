@@ -10,20 +10,19 @@ on:
       model_type:
         description: 'Model type to train'
         required:    true
-        default:     'lstm'
+        default:     'bert'
         type:        choice
         options:
           - nb
-          - lstm
           - bert
       epochs:
         description: 'Number of training epochs'
         required:    false
-        default:     '8'
+        default:     '2'
       batch_size:
         description: 'Batch size'
         required:    false
-        default:     '64'
+        default:     '8'
 
   # Auto-trigger after preprocessing completes
   workflow_run:
@@ -137,9 +136,9 @@ jobs:
           python src/model/model_train.py \
             --bucket     ${{ env.S3_BUCKET }} \
             --prefix     ${{ env.PROJECT_NAME }} \
-            --model-type ${{ github.event.inputs.model_type || 'lstm' }} \
-            --epochs     ${{ github.event.inputs.epochs     || '8' }} \
-            --batch-size ${{ github.event.inputs.batch_size || '64' }}
+            --model-type ${{ github.event.inputs.model_type || 'bert' }} \
+            --epochs     ${{ github.event.inputs.epochs     || '2' }} \
+            --batch-size ${{ github.event.inputs.batch_size || '8' }}
 
           # model_train.py writes model_data.env — load it into GITHUB_OUTPUT
           source model_data.env
@@ -239,7 +238,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Job Details:**" >> $GITHUB_STEP_SUMMARY
           echo "- Job Name:   \`${{ steps.start-training.outputs.job_name }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Model Type: \`${{ github.event.inputs.model_type || 'lstm' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Model Type: \`${{ github.event.inputs.model_type || 'bert' }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Timestamp:  \`${{ steps.timestamp.outputs.timestamp }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Region:     \`${{ env.AWS_REGION }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
