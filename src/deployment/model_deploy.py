@@ -148,7 +148,8 @@ def find_model_root(base_dir: str) -> str:
         dirs[:] = [d for d in dirs if d != "code"]
         found = set(files) & marker_files
         if len(found) >= 2:
-            print(f"   Found model files at: {root}  ({\', \'.join(sorted(found))})")
+            found_str = ", ".join(sorted(found))
+            print(f"   Found model files at: {root}  ({found_str})")
             return root
     return base_dir
 
