@@ -37,8 +37,9 @@ _DEVICE    = None
 _LABEL_MAP = {0: "REAL", 1: "FAKE"}
 
 
-def model_fn(model_dir):
-    """Called ONCE at container startup — load model into memory."""
+def model_fn(model_dir, context=None):
+    """Called ONCE at container startup — load model into memory.
+    context is passed by the HuggingFace DLC and must be accepted but is unused."""
     global _MODEL, _TOKENIZER, _DEVICE
 
     # ml.m5.large has NO GPU — always use CPU
