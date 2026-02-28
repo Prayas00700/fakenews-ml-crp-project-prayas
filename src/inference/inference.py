@@ -31,10 +31,12 @@ _DEVICE = None
 _LABEL_MAP = {0: "REAL", 1: "FAKE"}
 
 
-def model_fn(model_dir: str):
+def model_fn(model_dir: str, context=None):
     """
     Called ONCE at container startup. Load model + tokenizer into memory.
     SageMaker caches the return value and passes it to predict_fn.
+    The HuggingFace DLC calls model_fn(model_dir, context) — context is unused
+    but must be accepted to avoid 'takes 1 positional argument but 2 were given'.
     """
     global _MODEL, _TOKENIZER, _DEVICE
 
