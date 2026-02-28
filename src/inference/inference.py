@@ -34,26 +34,30 @@ _LABEL_MAP = {0: "REAL", 1: "FAKE"}
 def model_fn(model_dir: str, context=None):
     """
     Called ONCE at container startup. Load model + tokenizer into memory.
-    SageMaker caches the return value and passes it to predict_fn.
-    The HuggingFace DLC calls model_fn(model_dir, context) — context is unused
-    but must be accepted to avoid 'takes 1 positional argument but 2 were given'.
+    The HuggingFace DLC calls model_fn(model_dir, context) — context accepted but unused.
+
+    Confirmed structure from inspect_model.py:
+        /bert_tokenizer/  — vocab.txt, tokenizer_config.json, special_tokens_map.json
+        /bert_model/      — config.json, model.safetensors
+        /code/            — inference.py, requirements.txt
     """
     global _MODEL, _TOKENIZER, _DEVICE
 
-    # Always use CPU — endpoint uses ml.m5.large (no GPU)
     _DEVICE = torch.device("cpu")
 
-    # Try DistilBERT first (what model_deploy.py packs), then fall back to BERT
-    try:
-        _TOKENIZER = DistilBertTokenizerFast.from_pretrained(model_dir)
-        _MODEL = DistilBertForSequenceClassification.from_pretrained(model_dir)
-    except Exception:
-        _TOKENIZER = BertTokenizer.from_pretrained(model_dir)
-        _MODEL = BertForSequenceClassification.from_pretrained(model_dir)
+    tokenizer_path = os.path.join(model_dir, "bert_tokenizer")
+    model_path     = os.path.join(model_dir, "bert_model")
 
+    print(f"model_dir contents : {os.listdir(model_dir)}")
+    print(f"Loading tokenizer  : {tokenizer_path}")
+    print(f"Loading model      : {model_path}")
+
+    _TOKENIZER = BertTokenizer.from_pretrained(tokenizer_path)
+    _MODEL     = BertForSequenceClassification.from_pretrained(model_path)
     _MODEL.to(_DEVICE)
     _MODEL.eval()
 
+    print("Model and tokenizer loaded successfully.")
     return {"model": _MODEL, "tokenizer": _TOKENIZER, "device": _DEVICE}
 
 
