@@ -39,21 +39,29 @@ _LABEL_MAP = {0: "REAL", 1: "FAKE"}
 
 def model_fn(model_dir, context=None):
     """Called ONCE at container startup — load model into memory.
-    context is passed by the HuggingFace DLC and must be accepted but is unused."""
+    context is passed by the HuggingFace DLC and must be accepted but is unused.
+
+    Confirmed structure:
+        /bert_tokenizer/  — vocab.txt, tokenizer_config.json, special_tokens_map.json
+        /bert_model/      — config.json, model.safetensors
+    """
     global _MODEL, _TOKENIZER, _DEVICE
 
-    # ml.m5.large has NO GPU — always use CPU
     _DEVICE = torch.device("cpu")
 
-    try:
-        _TOKENIZER = DistilBertTokenizerFast.from_pretrained(model_dir)
-        _MODEL     = DistilBertForSequenceClassification.from_pretrained(model_dir)
-    except Exception:
-        _TOKENIZER = BertTokenizer.from_pretrained(model_dir)
-        _MODEL     = BertForSequenceClassification.from_pretrained(model_dir)
+    tokenizer_path = os.path.join(model_dir, "bert_tokenizer")
+    model_path     = os.path.join(model_dir, "bert_model")
 
+    print(f"model_dir contents : {os.listdir(model_dir)}")
+    print(f"Loading tokenizer  : {tokenizer_path}")
+    print(f"Loading model      : {model_path}")
+
+    _TOKENIZER = BertTokenizer.from_pretrained(tokenizer_path)
+    _MODEL     = BertForSequenceClassification.from_pretrained(model_path)
     _MODEL.to(_DEVICE)
     _MODEL.eval()
+
+    print("Model and tokenizer loaded successfully.")
     return {"model": _MODEL, "tokenizer": _TOKENIZER, "device": _DEVICE}
 
 
@@ -126,35 +134,83 @@ def find_latest_model(s3_client, bucket_name, project_name):
     raise FileNotFoundError("No trained model found in S3.")
 
 
+def find_model_root(base_dir: str) -> str:
+    """
+    Find the directory that actually contains model files.
+    After extraction, files may be nested in a subdirectory.
+    SageMaker requires them at the ROOT of /opt/ml/model.
+    """
+    marker_files = {
+        "config.json", "pytorch_model.bin", "model.safetensors",
+        "vocab.txt", "tokenizer_config.json", "special_tokens_map.json",
+    }
+    for root, dirs, files in os.walk(base_dir):
+        dirs[:] = [d for d in dirs if d != "code"]
+        found = set(files) & marker_files
+        if len(found) >= 2:
+            print(f"   Found model files at: {root}  ({\', \'.join(sorted(found))})")
+            return root
+    return base_dir
+
+
 def prepare_model_for_deployment(s3_client, bucket_name, project_name, model_uri):
     print("\n📦 Preparing model artifact (injecting fixed inference.py)...")
     model_key = model_uri.replace(f"s3://{bucket_name}/", "")
     s3_client.download_file(bucket_name, model_key, "model.tar.gz")
 
-    os.makedirs("./model", exist_ok=True)
+    # ── 1. Inspect tarball contents ───────────────────────────────────────────
+    print("\n📂 Contents of model.tar.gz:")
     with tarfile.open("model.tar.gz", "r:gz") as tar:
-        tar.extractall("./model")
+        members = tar.getnames()
+        for m in members[:30]:
+            print(f"   {m}")
+        if len(members) > 30:
+            print(f"   ... and {len(members) - 30} more files")
+
+    # ── 2. Extract ────────────────────────────────────────────────────────────
+    os.makedirs("./model_extracted", exist_ok=True)
+    with tarfile.open("model.tar.gz", "r:gz") as tar:
+        tar.extractall("./model_extracted")
     os.remove("model.tar.gz")
 
-    # SageMaker HuggingFace DLC looks for inference code in <model_dir>/code/
-    os.makedirs("./model/code", exist_ok=True)
+    # ── 3. Find actual model root (may be nested inside the tarball) ──────────
+    actual_root = find_model_root("./model_extracted")
+    print(f"\n✅ Model root identified: {actual_root}")
 
-    with open("./model/code/inference.py", "w") as f:
+    # ── 4. Build a flat staging dir — model files must be at ROOT of tarball ──
+    staging = "./model_staging"
+    if os.path.exists(staging):
+        shutil.rmtree(staging)
+    shutil.copytree(actual_root, staging)
+
+    # ── 5. Inject inference code into staging/code/ ───────────────────────────
+    os.makedirs(f"{staging}/code", exist_ok=True)
+    with open(f"{staging}/code/inference.py", "w") as f:
         f.write(INFERENCE_CODE)
-
-    # Pin versions compatible with the CPU container
-    with open("./model/code/requirements.txt", "w") as f:
+    with open(f"{staging}/code/requirements.txt", "w") as f:
         f.write("transformers==4.37.0\n")
         f.write("torch==2.1.0\n")
 
-    print("🗜️  Repackaging artifact...")
+    # ── 6. Verify tokenizer files are at root before repackaging ─────────────
+    staging_files = os.listdir(staging)
+    print(f"\n📋 Staging root contents: {staging_files}")
+    required = {"config.json", "tokenizer_config.json"}
+    missing  = required - set(staging_files)
+    if missing:
+        print(f"⚠️  WARNING: Missing files at staging root: {missing}")
+    else:
+        print("✅ Tokenizer files confirmed at root level")
+
+    # ── 7. Repackage and upload ───────────────────────────────────────────────
+    print("\n🗜️  Repackaging artifact...")
     with tarfile.open("deploy_model.tar.gz", "w:gz") as tar:
-        tar.add("./model", arcname=".")
+        tar.add(staging, arcname=".")
 
     deploy_key = f"{project_name}/models/deploy/model.tar.gz"
     s3_client.upload_file("deploy_model.tar.gz", bucket_name, deploy_key)
 
-    shutil.rmtree("./model")
+    shutil.rmtree("./model_extracted")
+    shutil.rmtree(staging)
     os.remove("deploy_model.tar.gz")
     print(f"✅ Artifact uploaded to s3://{bucket_name}/{deploy_key}")
     return f"s3://{bucket_name}/{deploy_key}"
