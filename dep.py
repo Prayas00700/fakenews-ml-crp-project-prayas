@@ -67,7 +67,7 @@ EPOCHS      = int(os.environ.get("EPOCHS",     8))
 BERT_MODEL_NAME  = "bert-base-uncased"
 BERT_MAX_LEN     = 256
 BERT_BATCH_SIZE  = 8
-BERT_EPOCHS      = 2
+BERT_EPOCHS      = 10
 BERT_LR          = 2e-5
 
 # ─────────────────────────────────────────────
