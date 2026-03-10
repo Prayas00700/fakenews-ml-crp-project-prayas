@@ -53,10 +53,11 @@ from botocore.exceptions import BotoCoreError, ClientError
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 
-# Allow running from the repo root without installing the package
+# Allow running from the repo root (local/GH Actions) AND from SageMaker container
+# where dep.py is copied to the same directory as this script.
 _this_dir = Path(__file__).resolve().parent
-sys.path.insert(0, str(_this_dir))            # SageMaker: dep.py in same dir
-sys.path.insert(0, str(_this_dir.parents[1])) # local/GH Actions: repo root
+sys.path.insert(0, str(_this_dir))              # SageMaker: dep.py is in same dir
+sys.path.insert(0, str(_this_dir.parents[1]))   # local/GH Actions: repo root
 from dep import (
     AWS_REGION,
     DATA1_FILENAME,
@@ -249,29 +250,32 @@ def prepare_df1(df: pd.DataFrame) -> pd.DataFrame:
 
 def prepare_df2(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Prepare FakeNewsNet.csv
-    Confirmed columns: title, news_url, source_domain, tweet_num, real
-      - 'real' is the label column (1 = real, 0 = fake)
-      - There is NO 'text' column; only 'title' is used as the text feature
+    Prepare merged_news.csv (clmentbisaillon/fake-and-real-news-dataset).
+    Created by data_download.py merging Fake.csv + True.csv with injected label column.
+    Columns: title, text, subject, date, label  (label: 0=fake, 1=real)
     """
-    logger.info("Preparing df2 (FakeNewsNet)...")
+    logger.info("Preparing df2 (merged_news / clmentbisaillon)...")
+    logger.info("  Available columns: %s", list(df.columns))
 
-    # Validate required columns
-    missing = [c for c in ("title", "news_url", "source_domain", "tweet_num", "real") if c not in df.columns]
-    if missing:
-        logger.error(
-            "  CRITICAL: Missing expected columns %s. Available: %s",
-            missing, list(df.columns),
-        )
+    if "label" not in df.columns:
+        logger.error("  CRITICAL: 'label' column missing. Available: %s", list(df.columns))
         sys.exit(1)
 
-    # Rename 'real' → 'label'  (1 = real news, 0 = fake news)
-    df = df.rename(columns={"real": "label"})
-    logger.info("  Renamed column 'real' → 'label'")
+    title_col = "title" if "title" in df.columns else None
+    text_col  = "text"  if "text"  in df.columns else None
 
-    # FakeNewsNet has no body text — use title only as the text feature
-    df["title"] = df["title"].fillna("")
-    df["clean_text_raw"] = df["title"].astype(str).str.strip()
+    if title_col and text_col:
+        df["clean_text_raw"] = (
+            df[title_col].fillna("").astype(str) + " " +
+            df[text_col].fillna("").astype(str)
+        ).str.strip()
+    elif text_col:
+        df["clean_text_raw"] = df[text_col].fillna("").astype(str).str.strip()
+    elif title_col:
+        df["clean_text_raw"] = df[title_col].fillna("").astype(str).str.strip()
+    else:
+        logger.error("  CRITICAL: No usable text column found. Available: %s", list(df.columns))
+        sys.exit(1)
 
     df["label_norm"] = df["label"].apply(normalize_label)
 
