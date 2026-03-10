@@ -41,7 +41,7 @@ DATA3_FILENAME  = "fake_news_dataset_1000.csv"  # additional dataset
 # ─────────────────────────────────────────────
 SAGEMAKER_ROLE_ARN       = os.environ.get("SAGEMAKER_ROLE_ARN",       "")
 SAGEMAKER_INSTANCE       = os.environ.get("SAGEMAKER_INSTANCE",       "ml.t3.medium")
-SAGEMAKER_INSTANCE_TRAIN = os.environ.get("SAGEMAKER_INSTANCE_TRAIN", "ml.g4dn.xlarge")
+SAGEMAKER_INSTANCE_TRAIN = os.environ.get("SAGEMAKER_INSTANCE_TRAIN", "ml.g4dn.2xlarge")
 
 # ─────────────────────────────────────────────
 # Model / Training Hyperparameters
