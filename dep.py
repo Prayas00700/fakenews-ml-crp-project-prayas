@@ -32,7 +32,7 @@ S3_ARTIFACTS_PREFIX  = f"{PROJECT_NAME}/artifacts/"
 # Local data filenames (CSV files on your machine / in the repo's data/local/)
 LOCAL_DATA_DIR  = os.environ.get("LOCAL_DATA_DIR", "data/local")
 DATA1_FILENAME  = "fake_or_real_news.csv"
-DATA2_FILENAME  = "merged_news.csv"   # clmentbisaillon: Fake.csv + True.csv merged by data_download.py
+DATA2_FILENAME  = "merged_news.csv"  # clmentbisaillon: Fake.csv + True.csv merged by data_download.py
 
 # ─────────────────────────────────────────────
 # SageMaker Configuration
