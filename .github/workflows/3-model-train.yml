@@ -44,7 +44,7 @@ env:
   S3_BUCKET:                ${{ secrets.S3_BUCKET }}
   PROJECT_NAME:             ${{ vars.PROJECT_NAME }}
   SAGEMAKER_ROLE_ARN:       ${{ secrets.SAGEMAKER_ROLE_ARN }}
-  SAGEMAKER_INSTANCE_TRAIN: ${{ vars.SAGEMAKER_INSTANCE_TRAIN || 'ml.g4dn.xlarge' }}
+  SAGEMAKER_INSTANCE_TRAIN: ${{ vars.SAGEMAKER_INSTANCE_TRAIN || 'ml.g4dn.2xlarge' }}
   SAGEMAKER_INSTANCE:       ${{ vars.SAGEMAKER_INSTANCE       || 'ml.m5.xlarge' }}
 
 jobs:
@@ -153,7 +153,7 @@ jobs:
             --bucket     ${{ env.S3_BUCKET }} \
             --prefix     ${{ env.PROJECT_NAME }} \
             --model-type ${{ github.event.inputs.model_type || 'bert' }} \
-            --epochs     ${{ github.event.inputs.epochs     || '2' }} \
+            --epochs     ${{ github.event.inputs.epochs     || '10' }} \
             --batch-size ${{ github.event.inputs.batch_size || '8' }}
 
           # model_train.py writes model_data.env — load it into GITHUB_OUTPUT
