@@ -53,15 +53,15 @@ from botocore.exceptions import BotoCoreError, ClientError
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 
-# Allow running from the repo root (local/GH Actions) AND from SageMaker container
-# where dep.py is copied to the same directory as this script.
+# Allow running from the repo root without installing the package
 _this_dir = Path(__file__).resolve().parent
-sys.path.insert(0, str(_this_dir))              # SageMaker: dep.py is in same dir
-sys.path.insert(0, str(_this_dir.parents[1]))   # local/GH Actions: repo root
+sys.path.insert(0, str(_this_dir))            # SageMaker: dep.py in same dir
+sys.path.insert(0, str(_this_dir.parents[1])) # local/GH Actions: repo root
 from dep import (
     AWS_REGION,
     DATA1_FILENAME,
     DATA2_FILENAME,
+    DATA3_FILENAME,
 )
 
 logging.basicConfig(
@@ -249,32 +249,57 @@ def prepare_df1(df: pd.DataFrame) -> pd.DataFrame:
 
 def prepare_df2(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Prepare merged_news.csv (clmentbisaillon/fake-and-real-news-dataset).
-    Created by data_download.py merging Fake.csv + True.csv with injected label column.
-    Columns: title, text, subject, date, label  (label: 0=fake, 1=real)
+    Prepare FakeNewsNet.csv
+    Confirmed columns: title, news_url, source_domain, tweet_num, real
+      - 'real' is the label column (1 = real, 0 = fake)
+      - There is NO 'text' column; only 'title' is used as the text feature
     """
-    logger.info("Preparing df2 (merged_news / clmentbisaillon)...")
+    logger.info("Preparing df2 (FakeNewsNet)...")
+
+    # Validate required columns
+    missing = [c for c in ("title", "news_url", "source_domain", "tweet_num", "real") if c not in df.columns]
+    if missing:
+        logger.error(
+            "  CRITICAL: Missing expected columns %s. Available: %s",
+            missing, list(df.columns),
+        )
+        sys.exit(1)
+
+    # Rename 'real' → 'label'  (1 = real news, 0 = fake news)
+    df = df.rename(columns={"real": "label"})
+    logger.info("  Renamed column 'real' → 'label'")
+
+    # FakeNewsNet has no body text — use title only as the text feature
+    df["title"] = df["title"].fillna("")
+    df["clean_text_raw"] = df["title"].astype(str).str.strip()
+
+    df["label_norm"] = df["label"].apply(normalize_label)
+
+    before = len(df)
+    df = df.dropna(subset=["label_norm"]).reset_index(drop=True)
+    logger.info("  Dropped %d rows with unrecognised labels", before - len(df))
+    logger.info("  Shape: %s  |  Labels: %s", df.shape, df["label_norm"].value_counts().to_dict())
+
+    return df[["clean_text_raw", "label_norm"]].rename(columns={"label_norm": "label"})
+
+
+def prepare_df3(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prepare fake_news_dataset_1000.csv
+    Columns: title, text, label  (label: 'fake' / 'real')
+    """
+    logger.info("Preparing df3 (fake_news_dataset_1000)...")
     logger.info("  Available columns: %s", list(df.columns))
 
-    if "label" not in df.columns:
-        logger.error("  CRITICAL: 'label' column missing. Available: %s", list(df.columns))
+    missing = [c for c in ("title", "text", "label") if c not in df.columns]
+    if missing:
+        logger.error("  CRITICAL: Missing columns %s. Available: %s", missing, list(df.columns))
         sys.exit(1)
 
-    title_col = "title" if "title" in df.columns else None
-    text_col  = "text"  if "text"  in df.columns else None
-
-    if title_col and text_col:
-        df["clean_text_raw"] = (
-            df[title_col].fillna("").astype(str) + " " +
-            df[text_col].fillna("").astype(str)
-        ).str.strip()
-    elif text_col:
-        df["clean_text_raw"] = df[text_col].fillna("").astype(str).str.strip()
-    elif title_col:
-        df["clean_text_raw"] = df[title_col].fillna("").astype(str).str.strip()
-    else:
-        logger.error("  CRITICAL: No usable text column found. Available: %s", list(df.columns))
-        sys.exit(1)
+    df["clean_text_raw"] = (
+        df["title"].fillna("").astype(str) + " " +
+        df["text"].fillna("").astype(str)
+    ).str.strip()
 
     df["label_norm"] = df["label"].apply(normalize_label)
 
@@ -371,14 +396,16 @@ def main() -> int:
         s3 = get_s3_client()
         raw_df1 = load_latest_csv_from_s3(s3, args.bucket, args.prefix, DATA1_FILENAME)
         raw_df2 = load_latest_csv_from_s3(s3, args.bucket, args.prefix, DATA2_FILENAME)
+        raw_df3 = load_latest_csv_from_s3(s3, args.bucket, args.prefix, DATA3_FILENAME)
 
         # ── Step 3: Prepare each dataset ──────────────────────────────────────
         df1_proc = prepare_df1(raw_df1)
         df2_proc = prepare_df2(raw_df2)
-        logger.info("df1 shape: %s  |  df2 shape: %s", df1_proc.shape, df2_proc.shape)
+        df3_proc = prepare_df3(raw_df3)
+        logger.info("df1 shape: %s  |  df2 shape: %s  |  df3 shape: %s", df1_proc.shape, df2_proc.shape, df3_proc.shape)
 
         # ── Step 4: Merge ──────────────────────────────────────────────────────
-        df = pd.concat([df1_proc, df2_proc], ignore_index=True)
+        df = pd.concat([df1_proc, df2_proc, df3_proc], ignore_index=True)
         logger.info("Merged shape: %s", df.shape)
         logger.info("Merged label distribution:\n%s", df["label"].value_counts())
 
@@ -399,6 +426,7 @@ def main() -> int:
             "real_count":    int((df["label"] == "real").sum()),
             "df1_rows":      int(len(df1_proc)),
             "df2_rows":      int(len(df2_proc)),
+            "df3_rows":      int(len(df3_proc)),
             "num_features":  int(len(df.columns)),
             "columns":       list(df.columns),
             "bucket":        args.bucket,
