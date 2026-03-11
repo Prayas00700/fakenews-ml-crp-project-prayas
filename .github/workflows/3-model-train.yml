@@ -44,7 +44,7 @@ env:
   S3_BUCKET:                ${{ secrets.S3_BUCKET }}
   PROJECT_NAME:             ${{ vars.PROJECT_NAME }}
   SAGEMAKER_ROLE_ARN:       ${{ secrets.SAGEMAKER_ROLE_ARN }}
-  SAGEMAKER_INSTANCE_TRAIN: ${{ vars.SAGEMAKER_INSTANCE_TRAIN || 'ml.g4dn.2xlarge' }}
+  SAGEMAKER_INSTANCE_TRAIN: ${{ vars.SAGEMAKER_INSTANCE_TRAIN || 'ml.g4dn.xlarge' }}
   SAGEMAKER_INSTANCE:       ${{ vars.SAGEMAKER_INSTANCE       || 'ml.m5.xlarge' }}
 
 jobs:
@@ -64,7 +64,6 @@ jobs:
 
     outputs:
       job-name:      ${{ steps.start-training.outputs.job_name }}
-      model-s3-uri:  ${{ steps.get-model.outputs.model_uri }}
       model-type:    ${{ steps.start-training.outputs.model_type }}
 
     steps:
@@ -154,87 +153,16 @@ jobs:
             --prefix     ${{ env.PROJECT_NAME }} \
             --model-type ${{ github.event.inputs.model_type || 'bert' }} \
             --epochs     ${{ github.event.inputs.epochs     || '10' }} \
-            --batch-size ${{ github.event.inputs.batch_size || '8' }}
+            --batch-size ${{ github.event.inputs.batch_size || '8' }} \
+            --no-wait
 
-          # model_train.py writes model_data.env — load it into GITHUB_OUTPUT
+          # model_train.py writes model_data.env with job name — load into GITHUB_OUTPUT
           source model_data.env
           echo "job_name=$TRAINING_JOB_NAME"    >> $GITHUB_OUTPUT
-          echo "model_uri=$MODEL_DATA"           >> $GITHUB_OUTPUT
           echo "model_type=$MODEL_TYPE"          >> $GITHUB_OUTPUT
 
       # ================================================================
-      # Step 8: Get model artifacts URI
-      # ================================================================
-      - name: Get model artifacts
-        id: get-model
-        run: |
-          python - <<'EOF'
-          import boto3, os
-
-          job_name = "${{ steps.start-training.outputs.job_name }}"
-          region   = "${{ env.AWS_REGION }}"
-
-          sm       = boto3.client('sagemaker', region_name=region)
-          response = sm.describe_training_job(TrainingJobName=job_name)
-          model_uri = response['ModelArtifacts']['S3ModelArtifacts']
-
-          print(f"Model saved to: {model_uri}")
-
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"model_uri={model_uri}\n")
-          EOF
-
-      # ================================================================
-      # Step 9: Verify model artifacts in S3
-      # ================================================================
-      - name: Verify model artifacts
-        run: |
-          echo "Verifying model artifacts..."
-
-          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/models/output/ \
-            --recursive \
-            --human-readable
-
-          echo "Model artifacts verified"
-
-      # ================================================================
-      # Step 10: Download and inspect training metrics
-      # ================================================================
-      - name: Download training metrics
-        run: |
-          echo "Downloading training metrics..."
-
-          MODEL_TAR=$(aws s3 ls \
-            s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/models/output/ \
-            --recursive | grep model.tar.gz | tail -1 | awk '{print $4}')
-
-          if [ -n "$MODEL_TAR" ]; then
-            aws s3 cp s3://${{ env.S3_BUCKET }}/$MODEL_TAR ./model.tar.gz
-            tar -xzf model.tar.gz
-
-            if [ -f metrics.json ]; then
-              echo ""
-              echo "Training Metrics:"
-              cat metrics.json | python -m json.tool
-            fi
-
-            if [ -f training_history.json ]; then
-              echo ""
-              echo "Training History (last 5 epochs):"
-              cat training_history.json | python -c "
-          import json, sys
-          h = json.load(sys.stdin)
-          keys = list(h.keys())
-          n = len(h[keys[0]])
-          for i in range(max(0, n-5), n):
-              parts = [f'{k}={h[k][i]:.4f}' for k in keys if i < len(h[k])]
-              print(f'  Epoch {i+1}: ' + '  '.join(parts))
-          "
-            fi
-          fi
-
-      # ================================================================
-      # Step 11: Save model data artifact for downstream jobs
+      # Step 8: Save job name artifact immediately after submission
       # ================================================================
       - name: Save model data artifact
         uses: actions/upload-artifact@v4
@@ -244,40 +172,140 @@ jobs:
           retention-days:  7
 
       # ================================================================
-      # Step 12: Create summary
+      # Step 9: Create summary
       # ================================================================
       - name: Create summary
         run: |
-          echo "## Model Training Complete ✓" >> $GITHUB_STEP_SUMMARY
+          echo "## Model Training Submitted ✓" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Job Details:**" >> $GITHUB_STEP_SUMMARY
           echo "- Job Name:   \`${{ steps.start-training.outputs.job_name }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Model Type: \`${{ github.event.inputs.model_type || 'bert' }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Timestamp:  \`${{ steps.timestamp.outputs.timestamp }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Region:     \`${{ env.AWS_REGION }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Model Location:**" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.get-model.outputs.model_uri }}" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
-          echo "1. Run '4. Model Evaluate' to check quality gates" >> $GITHUB_STEP_SUMMARY
-          echo "2. If gates pass, run '5. Model Deploy'" >> $GITHUB_STEP_SUMMARY
+          echo "Training is running on SageMaker. The 'Poll Training Job' job below will wait for completion." >> $GITHUB_STEP_SUMMARY
 
-      # ================================================================
-      # Step 13: Success message
-      # ================================================================
-      - name: Success
+  # ================================================================
+  # Job 2: Poll for training completion with a fresh AWS token
+  # Runs as a separate job so it gets a new 1-hour OIDC token
+  # ================================================================
+  poll-training:
+    name: "Poll Training Job Until Complete"
+    runs-on: ubuntu-latest
+    needs: train-model
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      model-s3-uri: ${{ steps.get-model.outputs.model_uri }}
+      model-type:   ${{ steps.get-model.outputs.model_type }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install boto3 sagemaker
+
+      - name: Download job name artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: model-data
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Wait for training job (with token refresh)
+        id: get-model
         run: |
-          echo ""
-          echo "=========================================="
-          echo " TRAINING PIPELINE COMPLETE"
-          echo "=========================================="
-          echo ""
-          echo "Model trained and saved to S3!"
-          echo "Location: ${{ steps.get-model.outputs.model_uri }}"
-          echo ""
-          echo "View training job in AWS Console:"
-          echo "SageMaker → Training → Training jobs → ${{ steps.start-training.outputs.job_name }}"
-          echo ""
+          python - <<'EOF'
+          import boto3, time, os, sys
+
+          # Read job name from artifact
+          job_name   = open("model_data.env").read().split("TRAINING_JOB_NAME=")[1].split()[0]
+          model_type = open("model_data.env").read().split("MODEL_TYPE=")[1].split()[0]
+          region     = os.environ["AWS_REGION"]
+
+          print(f"Polling job: {job_name}")
+          print("Polling every 60s with fresh credentials each time...")
+
+          last_status    = None
+          last_secondary = None
+          start_time     = time.time()
+
+          while True:
+              # Fresh client every iteration — picks up auto-refreshed OIDC creds
+              sm       = boto3.client("sagemaker", region_name=region)
+              response = sm.describe_training_job(TrainingJobName=job_name)
+              status   = response["TrainingJobStatus"]
+              secondary = response.get("SecondaryStatus", "")
+
+              if status != last_status or secondary != last_secondary:
+                  elapsed = int(time.time() - start_time)
+                  print(f"[{elapsed}s] {status} -> {secondary}")
+                  last_status    = status
+                  last_secondary = secondary
+
+              if status == "Completed":
+                  model_uri = response["ModelArtifacts"]["S3ModelArtifacts"]
+                  elapsed   = int(time.time() - start_time)
+                  print(f"
+Completed in {elapsed}s ({elapsed/60:.1f} min)")
+                  print(f"Model URI: {model_uri}")
+
+                  # Update model_data.env with real URI
+                  with open("model_data.env", "w") as f:
+                      f.write(f"MODEL_DATA={model_uri}
+")
+                      f.write(f"MODEL_TYPE={model_type}
+")
+                      f.write(f"TRAINING_JOB_NAME={job_name}
+")
+
+                  with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                      f.write(f"model_uri={model_uri}
+")
+                      f.write(f"model_type={model_type}
+")
+                  break
+
+              elif status in ("Failed", "Stopped"):
+                  reason = response.get("FailureReason", "Unknown")
+                  print(f"
+Job failed: {reason}")
+                  sys.exit(1)
+
+              time.sleep(60)
+          EOF
+
+      - name: Verify model artifacts in S3
+        run: |
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/models/output/ \
+            --recursive --human-readable
+
+      - name: Update model data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name:            model-data
+          path:            model_data.env
+          retention-days:  7
+          overwrite:       true
+
+      - name: Create summary
+        run: |
+          echo "## Model Training Complete ✓" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Job Name:  \`${{ needs.train-model.outputs.job-name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Model URI: \`${{ steps.get-model.outputs.model_uri }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next Steps:** Run '4. Model Evaluate'" >> $GITHUB_STEP_SUMMARY
