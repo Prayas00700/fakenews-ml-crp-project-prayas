@@ -491,23 +491,39 @@ def start_training_job(
     return response["TrainingJobArn"]
 
 
+def _fresh_sm_client(region: str) -> boto3.client:
+    """Always create a fresh SageMaker client to pick up refreshed credentials."""
+    return boto3.client("sagemaker", region_name=region)
+
+
 def wait_for_training_job(sm: boto3.client, job_name: str) -> dict:
-    """Poll the training job until completion; return the describe response."""
+    """Poll the training job until completion; return the describe response.
+    Recreates the boto3 client on every poll to handle token expiry gracefully.
+    """
     logger.info("Waiting for training job: %s", job_name)
-    logger.info("This may take 10–60 minutes depending on model type...")
+    logger.info("This may take 10-60 minutes depending on model type...")
 
     last_status     = None
     last_secondary  = None
     start_time      = time.time()
+    region          = sm.meta.region_name
 
     while True:
-        response       = sm.describe_training_job(TrainingJobName=job_name)
-        status         = response["TrainingJobStatus"]
-        secondary      = response.get("SecondaryStatus", "")
+        try:
+            # Recreate client each iteration to pick up refreshed credentials
+            sm_fresh   = _fresh_sm_client(region)
+            response   = sm_fresh.describe_training_job(TrainingJobName=job_name)
+        except Exception as exc:
+            logger.warning("Poll error (will retry): %s", exc)
+            time.sleep(30)
+            continue
+
+        status    = response["TrainingJobStatus"]
+        secondary = response.get("SecondaryStatus", "")
 
         if status != last_status or secondary != last_secondary:
             elapsed = int(time.time() - start_time)
-            logger.info("[%ds] Status: %s  →  %s", elapsed, status, secondary)
+            logger.info("[%ds] Status: %s  ->  %s", elapsed, status, secondary)
             last_status    = status
             last_secondary = secondary
 
