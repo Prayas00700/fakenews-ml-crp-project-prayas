@@ -44,7 +44,7 @@ env:
   S3_BUCKET:                ${{ secrets.S3_BUCKET }}
   PROJECT_NAME:             ${{ vars.PROJECT_NAME }}
   SAGEMAKER_ROLE_ARN:       ${{ secrets.SAGEMAKER_ROLE_ARN }}
-  SAGEMAKER_INSTANCE_TRAIN: ${{ vars.SAGEMAKER_INSTANCE_TRAIN || 'ml.g4dn.xlarge' }}
+  SAGEMAKER_INSTANCE_TRAIN: ${{ vars.SAGEMAKER_INSTANCE_TRAIN || 'ml.g4dn.2xlarge' }}
   SAGEMAKER_INSTANCE:       ${{ vars.SAGEMAKER_INSTANCE       || 'ml.m5.xlarge' }}
 
 jobs:
