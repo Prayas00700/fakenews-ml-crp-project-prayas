@@ -471,8 +471,8 @@ def start_training_job(
         },
         EnableManagedSpotTraining=True,
         StoppingCondition={
-            "MaxRuntimeInSeconds": 7200,    # 2 hours max
-            "MaxWaitTimeInSeconds": 14400,  # 4 hours max wait for spot
+            "MaxRuntimeInSeconds": 36000,   # 10 hours max (sufficient for 10 epochs)
+            "MaxWaitTimeInSeconds": 43200,  # 12 hours max wait for spot
         },
         HyperParameters=hyperparams,
         Tags=[
@@ -491,39 +491,23 @@ def start_training_job(
     return response["TrainingJobArn"]
 
 
-def _fresh_sm_client(region: str) -> boto3.client:
-    """Always create a fresh SageMaker client to pick up refreshed credentials."""
-    return boto3.client("sagemaker", region_name=region)
-
-
 def wait_for_training_job(sm: boto3.client, job_name: str) -> dict:
-    """Poll the training job until completion; return the describe response.
-    Recreates the boto3 client on every poll to handle token expiry gracefully.
-    """
+    """Poll the training job until completion; return the describe response."""
     logger.info("Waiting for training job: %s", job_name)
-    logger.info("This may take 10-60 minutes depending on model type...")
+    logger.info("This may take 10–60 minutes depending on model type...")
 
     last_status     = None
     last_secondary  = None
     start_time      = time.time()
-    region          = sm.meta.region_name
 
     while True:
-        try:
-            # Recreate client each iteration to pick up refreshed credentials
-            sm_fresh   = _fresh_sm_client(region)
-            response   = sm_fresh.describe_training_job(TrainingJobName=job_name)
-        except Exception as exc:
-            logger.warning("Poll error (will retry): %s", exc)
-            time.sleep(30)
-            continue
-
-        status    = response["TrainingJobStatus"]
-        secondary = response.get("SecondaryStatus", "")
+        response       = sm.describe_training_job(TrainingJobName=job_name)
+        status         = response["TrainingJobStatus"]
+        secondary      = response.get("SecondaryStatus", "")
 
         if status != last_status or secondary != last_secondary:
             elapsed = int(time.time() - start_time)
-            logger.info("[%ds] Status: %s  ->  %s", elapsed, status, secondary)
+            logger.info("[%ds] Status: %s  →  %s", elapsed, status, secondary)
             last_status    = status
             last_secondary = secondary
 
@@ -599,6 +583,7 @@ def main() -> None:
                         choices=["nb", "bert"],                  help="Model type to train")
     parser.add_argument("--epochs",      type=int, default=2,    help="Training epochs")
     parser.add_argument("--batch-size",  type=int, default=8,    help="Batch size")
+    parser.add_argument("--no-wait",     action="store_true",    help="Submit job and exit immediately without waiting")
     args = parser.parse_args()
 
     logger.info("=" * 70)
@@ -632,26 +617,44 @@ def main() -> None:
         args.epochs, args.batch_size, sourcedir_uri, script_name,
     )
 
-    # ── 3. Wait for completion ────────────────────────────────────────────────
+    # ── 3. Write job name immediately so it's available even in --no-wait mode ─
+    Path("model_data.env").write_text(
+        f"MODEL_DATA=pending\n"
+        f"MODEL_TYPE={args.model_type}\n"
+        f"TRAINING_JOB_NAME={job_name}\n"
+    )
+    logger.info("Wrote model_data.env (job submitted, model URI pending)")
+
+    if args.no_wait:
+        logger.info("=" * 70)
+        logger.info("TRAINING JOB SUBMITTED (--no-wait mode)")
+        logger.info("=" * 70)
+        logger.info("  Job name : %s", job_name)
+        logger.info("  Region   : %s", AWS_REGION)
+        logger.info("  Monitor  : SageMaker → Training → Training jobs → %s", job_name)
+        logger.info("=" * 70)
+        return
+
+    # ── 4. Wait for completion ────────────────────────────────────────────────
     response  = wait_for_training_job(sm, job_name)
     model_uri = response["ModelArtifacts"]["S3ModelArtifacts"]
 
-    # ── 4. Download + log metrics ─────────────────────────────────────────────
+    # ── 5. Download + log metrics ─────────────────────────────────────────────
     download_and_log_metrics(sm, s3, job_name, args.bucket, args.prefix)
 
-    # ── 5. Verify model artifacts ─────────────────────────────────────────────
+    # ── 6. Verify model artifacts ─────────────────────────────────────────────
     logger.info("Verifying model artifacts in S3...")
     objects = s3.list_objects_v2(Bucket=args.bucket, Prefix=f"{args.prefix}/models/output/")
     for obj in objects.get("Contents", []):
         logger.info("  %s", obj["Key"])
 
-    # ── 6. Write env file for downstream GitHub Actions jobs ─────────────────
+    # ── 7. Update env file with real model URI ────────────────────────────────
     Path("model_data.env").write_text(
         f"MODEL_DATA={model_uri}\n"
         f"MODEL_TYPE={args.model_type}\n"
         f"TRAINING_JOB_NAME={job_name}\n"
     )
-    logger.info("Wrote model_data.env")
+    logger.info("Updated model_data.env with final model URI")
 
     logger.info("=" * 70)
     logger.info("TRAINING PIPELINE COMPLETE")
