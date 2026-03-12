@@ -73,8 +73,10 @@ function displayResult(result) {
 
     // Safely parse the values
     const isFake = (predictionVal == 1 || String(labelVal).toLowerCase() === 'fake');
-    const parsedProb = parseFloat(probabilityVal);
-    const pct = isNaN(parsedProb) ? 'NaN' : (parsedProb * 100).toFixed(1);
+    const fakeProbVal = parseFloat(result.fake_prob ?? probabilityVal ?? 0);
+    const realProbVal = parseFloat(result.real_prob ?? (1 - fakeProbVal));
+    const pct = isNaN(fakeProbVal) ? 'NaN' : (fakeProbVal * 100).toFixed(1);
+    const realPct = isNaN(realProbVal) ? 'NaN' : (realProbVal * 100).toFixed(1);
     
     const interpretationVal = result.interpretation ?? result.Interpretation ?? 'No interpretation provided.';
     const confidenceVal = result.confidence ?? result.Confidence ?? 'UNDEFINED';
@@ -93,7 +95,7 @@ function displayResult(result) {
 
         <div class="metrics-row">
             <div class="metric-box">
-                <div class="metric-value">${isFake && pct !== 'NaN' ? pct + '%' : (!isFake && pct !== 'NaN' ? (100 - parseFloat(pct)).toFixed(1) + '%' : 'NaN')}</div>
+                <div class="metric-value">${isFake ? pct : realPct}%</div>
                 <div class="metric-label">${isFake ? 'Fake' : 'Real'} probability</div>
             </div>
             <div class="metric-box">
