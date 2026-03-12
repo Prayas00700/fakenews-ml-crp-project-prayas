@@ -1,12 +1,23 @@
 """
 api.py — FastAPI backend that proxies requests to the SageMaker endpoint.
-FIXED: Corrected response parsing to handle dictionary output from BERT inference.
+
+Your BERT model returns this shape:
+{
+  "label":       "FAKE" | "REAL",
+  "prediction":  1 | 0,
+  "fake_prob":   0.9963,
+  "real_prob":   0.0037,
+  "confidence":  0.9963,
+  "predictions": [1],
+  "probabilities": [[0.0037, 0.9963]],
+  "probabilities_named": {"REAL": 0.0037, "FAKE": 0.9963}
+}
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Optional
 import boto3
 from botocore.config import Config
 import json
@@ -15,124 +26,120 @@ from io import StringIO
 import os
 import logging
 
-# Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Fake News Detection API", version="1.1.0")
+app = FastAPI(title="Fake News Detection API", version="2.0.0")
 
-# Enable CORS for frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configuration from Environment
-ENDPOINT_NAME = os.getenv("SAGEMAKER_ENDPOINT", "gunjan-ml-crp-project-name-endpoint")
-AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
+ENDPOINT_NAME = os.getenv("SAGEMAKER_ENDPOINT", "prayas-ml-crp-project-name-endpoint")
+AWS_REGION    = os.getenv("AWS_REGION", "ap-south-1")
 
-logger.info(f"API v1.1 — endpoint: {ENDPOINT_NAME}  region: {AWS_REGION}")
+logger.info(f"API v2.0 — endpoint: {ENDPOINT_NAME}  region: {AWS_REGION}")
 
-# SageMaker Runtime Client with 60s timeout
-config = Config(read_timeout=60, retries={'max_attempts': 3})
+config           = Config(read_timeout=120, retries={"max_attempts": 2})
 sagemaker_runtime = boto3.client("sagemaker-runtime", region_name=AWS_REGION, config=config)
 
+
 class ArticleInput(BaseModel):
-    text: str
+    text:  str
     title: Optional[str] = ""
 
-def invoke_endpoint(text: str):
-    """
-    Invokes the SageMaker endpoint and handles the response.
-    FIXED: Unwraps the ['{json_string}', 'content_type'] list format.
-    """
-    payload = {"inputs": text}
-    
+
+def invoke_endpoint(text: str) -> dict:
+    """Invoke SageMaker endpoint. Always returns a flat dict."""
+    payload = {"text": text}   # your inference.py expects "text" key
+
     try:
         response = sagemaker_runtime.invoke_endpoint(
             EndpointName=ENDPOINT_NAME,
             ContentType="application/json",
-            Body=json.dumps(payload)
+            Body=json.dumps(payload),
         )
-        
-        # Read the response body
-        raw_body = response["Body"].read().decode("utf-8")
-        result = json.loads(raw_body)
-        
-        # --- NEW FIX: Handle the ['{...}', 'application/json'] list format ---
+        raw  = response["Body"].read().decode("utf-8")
+        result = json.loads(raw)
+
+        # Handle wrapped list format: ['{...json...}', 'application/json']
         if isinstance(result, list) and len(result) == 2 and isinstance(result[0], str):
-            logger.info("Detected nested JSON string in list. Unwrapping...")
             result = json.loads(result[0])
-        
-        logger.info(f"SageMaker Parsed Result: {result}")
-        
-        # Scenario A: Result is now the flat dict
-        if isinstance(result, dict):
-            return result
-            
-        # Scenario B: Standard Hugging Face List format
-        if isinstance(result, list) and len(result) > 0:
-            top = max(result, key=lambda x: x.get("score", 0))
-            return {
-                "label": top.get("label"),
-                "confidence": top.get("score"),
-                "prediction": 1 if top.get("label") == "FAKE" else 0
-            }
-            
+
+        logger.info("SageMaker result: %s", result)
         return result
 
     except Exception as e:
-        logger.error(f"Error invoking SageMaker: {str(e)}")
+        logger.error("SageMaker invocation error: %s", e)
         raise HTTPException(status_code=500, detail=f"Inference Error: {str(e)}")
 
-def _build_response(r: dict, title: str = ""):
-    """
-    Standardizes the response for the frontend regardless of model version.
-    """
-    # Map varying keys (confidence vs score, label vs prediction) to a fixed schema
-    label = r.get("label", "REAL")
-    
-    # Logic: if 'prediction' is missing, determine it from the label
-    prediction_val = r.get("prediction")
-    if prediction_val is None:
-        prediction_val = 1 if label == "FAKE" else 0
 
+def _confidence_label(confidence: float) -> str:
+    if confidence >= 0.95: return "Very High"
+    if confidence >= 0.80: return "High"
+    if confidence >= 0.60: return "Medium"
+    return "Low"
+
+
+def _interpretation(label: str, fake_prob: float) -> str:
+    pct = fake_prob * 100
+    if label == "FAKE":
+        if pct >= 95:
+            return f"Strong indicators of fabricated content ({pct:.1f}% fake probability). Do not share without verification."
+        if pct >= 80:
+            return f"Likely misinformation ({pct:.1f}% fake probability). Cross-check with trusted sources."
+        return f"Possible misinformation ({pct:.1f}% fake probability). Investigate before sharing."
+    else:
+        real_pct = (1 - fake_prob) * 100
+        if real_pct >= 95:
+            return f"Strong signals of authentic content ({real_pct:.1f}% real probability). Still verify key claims."
+        return f"Leans toward authentic ({real_pct:.1f}% real probability). Cross-check with primary sources."
+
+
+def _build_response(r: dict, title: str = "") -> dict:
+    """
+    Normalise raw endpoint output into the schema the frontend expects.
+    Your model already returns all keys — this just ensures nothing is missing.
+    """
+    label     = r.get("label", "REAL").upper()
+    fake_prob = float(r.get("fake_prob", 0.0))
+    real_prob = float(r.get("real_prob", 1 - fake_prob))
+    confidence_raw = float(r.get("confidence", max(fake_prob, real_prob)))
+
+    # The frontend's app.js uses: prediction, probability, label, confidence, interpretation
     return {
-        "title": title,
-        "prediction": int(prediction_val),
-        "label": label,
-        "score": float(r.get("confidence") or r.get("score") or 0.0),
-        "fake_prob": float(r.get("fake_prob", 0.0)),
-        "real_prob": float(r.get("real_prob", 0.0))
+        "title":          title,
+        "prediction":     1 if label == "FAKE" else 0,
+        "label":          label,
+        "probability":    round(fake_prob if label == "FAKE" else real_prob, 4),
+        "fake_prob":      round(fake_prob, 4),
+        "real_prob":      round(real_prob, 4),
+        "confidence":     _confidence_label(confidence_raw),
+        "confidence_raw": round(confidence_raw, 4),
+        "interpretation": _interpretation(label, fake_prob),
     }
+
 
 @app.get("/health")
 def health():
-    """Checks if the API is up and the SageMaker endpoint is reachable."""
-    try:
-        # Ping endpoint with a tiny string to verify live status
-        invoke_endpoint("health check")
-        return {"status": "healthy", "endpoint": ENDPOINT_NAME}
-    except Exception as e:
-        return {"status": "unhealthy", "error": str(e)}
+    return {"status": "ok", "endpoint": ENDPOINT_NAME, "region": AWS_REGION}
+
 
 @app.post("/predict")
 async def predict_single(article: ArticleInput):
-    """Endpoint for single article analysis."""
     if not article.text.strip():
         raise HTTPException(status_code=400, detail="Article text cannot be empty.")
 
-    combined_text = f"{article.title} {article.text}".strip()
-    
-    r = invoke_endpoint(combined_text)
-    return _build_response(r, title=article.title)
+    combined = f"{article.title} {article.text}".strip() if article.title else article.text.strip()
+    r = invoke_endpoint(combined)
+    return _build_response(r, title=article.title or "")
+
 
 @app.post("/predict/csv")
 async def predict_csv(file: UploadFile = File(...)):
-    """Endpoint for batch analysis via CSV upload."""
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="File must be a .csv")
 
@@ -143,32 +150,30 @@ async def predict_csv(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Could not parse CSV file.")
 
     if "text" not in df.columns:
-        raise HTTPException(
-            status_code=400,
-            detail="CSV must contain a 'text' column.",
-        )
-    
+        raise HTTPException(status_code=400, detail="CSV must contain a 'text' column.")
+
     if "title" not in df.columns:
         df["title"] = ""
 
     results = []
     for idx, row in df.iterrows():
         try:
-            combined_text = f"{row['title']} {row['text']}".strip()
-            r = invoke_endpoint(combined_text)
+            combined = f"{row['title']} {row['text']}".strip()
+            r    = invoke_endpoint(combined)
             resp = _build_response(r, title=str(row.get("title", "")))
-            results.append({
-                "row": int(idx),
-                **resp,
-            })
+            results.append({"row": int(idx), **resp})
         except Exception as e:
-            logger.warning(f"Skipping row {idx} due to error: {e}")
+            logger.warning("Skipping row %d: %s", idx, e)
+
+    fake_count = sum(1 for r in results if r["prediction"] == 1)
+    high_conf  = sum(1 for r in results if r["confidence"] in ("High", "Very High"))
 
     return {
         "total_articles": len(results),
-        "predictions": results,
+        "predictions":    results,
         "summary": {
-            "fake_detected": sum(1 for r in results if r["prediction"] == 1),
-            "real_detected": sum(1 for r in results if r["prediction"] == 0),
-        }
+            "fake_detected":    fake_count,
+            "real_detected":    len(results) - fake_count,
+            "high_confidence":  high_conf,
+        },
     }
