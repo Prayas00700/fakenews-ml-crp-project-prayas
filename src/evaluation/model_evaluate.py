@@ -43,13 +43,8 @@ log = logging.getLogger(__name__)
 
 
 def get_s3_client():
-    return boto3.client(
-        "s3",
-        region_name=AWS_REGION,
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-        aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
-    )
+    """Always create a fresh client so expired tokens are never reused."""
+    return boto3.client("s3", region_name=AWS_REGION)
 
 
 def parse_s3_uri(uri: str):
@@ -178,6 +173,7 @@ def main() -> None:
 
         metrics_path = tmp / "eval_metrics.json"
         metrics_path.write_text(json.dumps(metrics, indent=2))
+        s3 = get_s3_client()  # fresh client before upload — avoids expired token
         s3.upload_file(
             Filename=str(metrics_path),
             Bucket=S3_BUCKET,
