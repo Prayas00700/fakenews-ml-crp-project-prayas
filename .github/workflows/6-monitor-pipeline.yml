@@ -25,7 +25,7 @@ env:
   S3_BUCKET:               ${{ secrets.S3_BUCKET }}
   PROJECT_NAME:            ${{ vars.PROJECT_NAME }}
   SAGEMAKER_ROLE_ARN:      ${{ secrets.SAGEMAKER_ROLE_ARN }}
-  SAGEMAKER_ENDPOINT_NAME: ${{ secrets.SAGEMAKER_ENDPOINT_NAME }}
+  SAGEMAKER_ENDPOINT_NAME: ${{ vars.SAGEMAKER_ENDPOINT_NAME || 'prayas-ml-crp-project-name-endpoint' }}
   ENDPOINT_INSTANCE:       ${{ vars.ENDPOINT_INSTANCE || 'ml.m5.large' }}
 
 jobs:
@@ -52,7 +52,7 @@ jobs:
           python-version: '3.9'
 
       - name: Install dependencies
-        run: pip install boto3 sagemaker pandas pyarrow
+        run: pip install boto3 'sagemaker>=2.200.0' pandas pyarrow
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
@@ -92,7 +92,7 @@ jobs:
           python-version: '3.9'
 
       - name: Install dependencies
-        run: pip install boto3 sagemaker
+        run: pip install boto3 'sagemaker>=2.200.0'
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
