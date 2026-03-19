@@ -22,7 +22,6 @@ import os
 import re
 import numpy as np
 import logging
-from itertools import combinations
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -172,37 +171,21 @@ def _get_fake_prob(text: str) -> float:
         return 0.5
 
 
-def _shapley_kernel_weight(subset_size: int, total: int) -> float:
-    """
-    KernelSHAP weight for a coalition of given size.
-    w(S) = (M-1) / (C(M,|S|) * |S| * (M - |S|))
-    where M = total number of features (words).
-    Coalitions of size 0 or M get weight infinity (handled separately).
-    """
-    from math import comb
-    if subset_size == 0 or subset_size == total:
-        return 1e10  # very large weight for boundary conditions
-    return (total - 1) / (comb(total, subset_size) * subset_size * (total - subset_size))
-
-
 def shap_explain(text: str, top_n: int = EXPLANATION_TOP_N) -> list:
     """
     KernelSHAP word-level attribution for a black-box text classifier.
 
-    Algorithm:
-      1. Tokenize text, deduplicate meaningful words → feature set F of size M
-      2. For each word i in F:
-         a. Sample `SHAP_SAMPLES` random coalitions S NOT containing i
-         b. Compute f(S ∪ {i}) - f(S) for each coalition (marginal contribution)
-         c. Weight each difference by the KernelSHAP weight w(|S|)
-         d. SHAP value φᵢ = weighted average of marginal contributions
-      3. Return top_n words by |φᵢ|
+    For each word i:
+      - Sample SHAP_SAMPLES random coalitions S from the OTHER words
+      - Only use coalitions where 1 <= |S| <= M-2  (skip empty/full — they
+        are boundary conditions that cause numerical instability)
+      - weight(S) = (M-1) / (C(M-1, |S|) * (|S|+1) * (M-1-|S|))
+        (standard KernelSHAP weight, adapted for coalitions of size 1..M-2)
+      - marginal(S, i) = f(S ∪ {i}) - f(S)
+      - shap(i) = weighted_average(marginals)
 
-    Positive φ  → word increases fake probability → pushes toward FAKE
-    Negative φ  → word decreases fake probability → pushes toward REAL
-
-    This satisfies the Shapley axioms (efficiency, symmetry, dummy, additivity)
-    giving theoretically grounded, consistent feature attributions.
+    Positive shap → word raises fake_prob → pushes toward FAKE
+    Negative shap → word lowers fake_prob → pushes toward REAL
     """
     tokens = _tokenize(text)
     if not tokens:
@@ -217,86 +200,91 @@ def shap_explain(text: str, top_n: int = EXPLANATION_TOP_N) -> list:
         if word_lower not in seen:
             seen[word_lower] = i
 
-    word_indices = list(seen.values())    # indices into tokens list
-    word_keys    = list(seen.keys())      # lowercase keys
+    word_indices = list(seen.values())
+    word_keys    = list(seen.keys())
     M = len(word_indices)
-
     if M == 0:
         return []
 
-    # Limit to top SHAP_MAX_WORDS most central tokens (by position spread)
+    # Subsample evenly if too many words
     if M > SHAP_MAX_WORDS:
-        # Take every Nth word to cover the article evenly
-        step = M // SHAP_MAX_WORDS
+        step         = M // SHAP_MAX_WORDS
         word_indices = word_indices[::step][:SHAP_MAX_WORDS]
         word_keys    = word_keys[::step][:SHAP_MAX_WORDS]
-        M = len(word_indices)
+        M            = len(word_indices)
 
     logger.info("KernelSHAP: M=%d words, %d samples each", M, SHAP_SAMPLES)
 
-    # Baseline: empty text (all words masked) and full text
-    baseline_prob = _get_fake_prob("")   # f(∅)
-    full_prob     = _get_fake_prob(text) # f(F)
-    logger.info("KernelSHAP baseline=%.4f  full=%.4f", baseline_prob, full_prob)
+    full_prob = _get_fake_prob(text)
+    logger.info("KernelSHAP full_prob=%.4f", full_prob)
 
-    shap_values = np.zeros(M)
-    shap_weights_sum = np.zeros(M)
+    from math import comb as _comb
+
+    def kernel_weight(s: int, m: int) -> float:
+        """
+        Weight for coalition of size s out of m-1 other words.
+        Skips s=0 and s=m-1 (boundary) — caller ensures 1 <= s <= m-2.
+        """
+        if m <= 2 or s <= 0 or s >= m - 1:
+            return 1.0
+        return (m - 1) / (_comb(m - 1, s) * s * (m - 1 - s))
 
     rng = np.random.default_rng(seed=42)
+    shap_values = np.zeros(M)
 
     for i in range(M):
-        marginals = []
-        weights   = []
+        other = [j for j in range(M) if j != i]  # indices of all words except i
+        n_other = len(other)
+
+        weighted_sum = 0.0
+        weight_total = 0.0
 
         for _ in range(SHAP_SAMPLES):
-            # Random coalition S of the OTHER M-1 words (not including word i)
-            other_indices = [j for j in range(M) if j != i]
-            # Random subset size for the coalition
-            s_size = int(rng.integers(0, M))  # 0 to M-1
-            if s_size > 0 and len(other_indices) > 0:
-                chosen = rng.choice(other_indices, size=min(s_size, len(other_indices)), replace=False).tolist()
+            # Coalition size: 1 to n_other (skip 0 to avoid empty-text prob=0.5 noise)
+            if n_other == 0:
+                s_size = 0
+            elif n_other == 1:
+                s_size = 1
+            else:
+                # Sample coalition sizes 1..n_other-1 to stay away from boundaries
+                s_size = int(rng.integers(1, n_other))
+
+            if s_size > 0:
+                chosen = rng.choice(other, size=s_size, replace=False).tolist()
             else:
                 chosen = []
 
-            # Build masks: S without word i, and S with word i
-            mask_without = [False] * len(tokens)
-            mask_with    = [False] * len(tokens)
-
+            # Build text WITH and WITHOUT word i
+            mask_base = [False] * len(tokens)
             for j in chosen:
-                mask_without[word_indices[j]] = True
-                mask_with[word_indices[j]]    = True
-            mask_with[word_indices[i]] = True  # add word i
+                mask_base[word_indices[j]] = True
 
-            text_without = _build_masked_text(tokens, mask_without)
-            text_with    = _build_masked_text(tokens, mask_with)
+            mask_with           = mask_base[:]
+            mask_with[word_indices[i]] = True
 
-            prob_without = _get_fake_prob(text_without)
-            prob_with    = _get_fake_prob(text_with)
+            text_base = _build_masked_text(tokens, mask_base)
+            text_with = _build_masked_text(tokens, mask_with)
 
-            marginal = prob_with - prob_without
-            weight   = _shapley_kernel_weight(len(chosen), M)
+            prob_base = _get_fake_prob(text_base)
+            prob_with = _get_fake_prob(text_with)
 
-            marginals.append(marginal)
-            weights.append(weight)
+            marginal = prob_with - prob_base
+            w        = kernel_weight(s_size, M)
 
-        # Weighted average of marginal contributions
-        total_w = sum(weights)
-        if total_w > 0:
-            shap_values[i] = sum(m * w for m, w in zip(marginals, weights)) / total_w
-        else:
-            shap_values[i] = 0.0
+            weighted_sum += marginal * w
+            weight_total += w
 
+        shap_values[i] = (weighted_sum / weight_total) if weight_total > 0 else 0.0
         logger.info("  word='%s' shap=%.4f", word_keys[i], shap_values[i])
 
-    # Build result list
-    results = []
-    for i in range(M):
-        results.append({
-            "word":      tokens[word_indices[i]],   # original casing
+    results = [
+        {
+            "word":      tokens[word_indices[i]],
             "score":     round(float(shap_values[i]), 4),
             "direction": "fake" if shap_values[i] > 0 else "real",
-        })
-
+        }
+        for i in range(M)
+    ]
     results.sort(key=lambda x: abs(x["score"]), reverse=True)
     return results[:top_n]
 
